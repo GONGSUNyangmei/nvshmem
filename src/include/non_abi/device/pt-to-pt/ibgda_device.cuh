@@ -23,7 +23,7 @@
 
 #include <algorithm>
 
-// #define NVSHMEM_IBGDA_DEBUG
+#define NVSHMEM_IBGDA_DEBUG
 // #define NVSHMEM_TIMEOUT_DEVICE_POLLING
 
 #define NVSHMEMI_MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -210,6 +210,65 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE bool ibgda_is_rc_enabled() {
     return ibgda_get_state()->num_rc_per_pe > 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  IBGDA latency profiling counters                                  */
+/*                                                                    */
+/*  These are accumulated by ibgda_rma_thread (single-thread put path) */
+/*  to break each call into two phases: WQE preparation and doorbell  */
+/*  submission. The host reads them via                               */
+/*  nvshmemx_ibgda_lat_profile_get() declared in                      */
+/*  nvshmemx_ibgda_lat_profile.h.                                     */
+/*                                                                    */
+/*  The symbols are always defined (in init_device.cu) so the host    */
+/*  ABI is stable; only the on-device sampling code is gated by       */
+/*  NVSHMEM_IBGDA_LAT_PROFILE.                                        */
+/* ------------------------------------------------------------------ */
+extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_wqe_sum;
+extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_wqe_max;
+extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_db_sum;
+extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_db_max;
+extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_count;
+
+/* Per-iter CQE-timestamp ring buffer. The arrays are allocated and the
+   device pointers + cap are published by the host via
+   nvshmemx_ibgda_lat_profile_cqe_ts_reset(). The recorder in ibgda_poll_cq
+   writes (cqe_ts_cycles, gpu_now_ns) pairs at slot = atomicAdd(&count, 1)
+   while count < cap, then keeps incrementing count past cap so the host can
+   detect overflow. */
+extern __device__ unsigned long long *nvshmemi_ibgda_cqe_ts_buf;
+extern __device__ unsigned long long *nvshmemi_ibgda_gpu_ns_buf;
+extern __device__ unsigned long long nvshmemi_ibgda_cqe_ts_cap;
+extern __device__ unsigned long long nvshmemi_ibgda_cqe_ts_count;
+
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record(
+    unsigned long long wqe_cycles, unsigned long long db_cycles) {
+    /* atomicAdd_system / atomicMax_system so accumulation is correct
+       regardless of which CTA / SM the issuing thread runs on. */
+    atomicAdd_system(&nvshmemi_ibgda_lat_prof_wqe_sum, wqe_cycles);
+    atomicAdd_system(&nvshmemi_ibgda_lat_prof_db_sum, db_cycles);
+    atomicMax_system(&nvshmemi_ibgda_lat_prof_wqe_max, wqe_cycles);
+    atomicMax_system(&nvshmemi_ibgda_lat_prof_db_max, db_cycles);
+    atomicAdd_system(&nvshmemi_ibgda_lat_prof_count, 1ull);
+}
+
+/* Append one (HCA cycles, GPU globaltimer ns) pair to the ring buffer if
+   the host has published a buffer and we're still under cap. Always
+   advances the device count so the host can see overflow via
+   count > cap. */
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record_cqe_ts(
+    unsigned long long cqe_ts_cycles, unsigned long long gpu_now_ns) {
+    unsigned long long cap = nvshmemi_ibgda_cqe_ts_cap;
+    unsigned long long slot = atomicAdd_system(&nvshmemi_ibgda_cqe_ts_count, 1ULL);
+    if (cap == 0 || nvshmemi_ibgda_cqe_ts_buf == nullptr ||
+        nvshmemi_ibgda_gpu_ns_buf == nullptr) return;
+    if (slot < cap) {
+        nvshmemi_ibgda_cqe_ts_buf[slot] = cqe_ts_cycles;
+        nvshmemi_ibgda_gpu_ns_buf[slot] = gpu_now_ns;
+    }
+}
+#endif
 
 // Prevent code reordering from both compiler and GPU
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void IBGDA_MFENCE() {
@@ -498,14 +557,13 @@ static_assert(NVSHMEMI_IBGDA_MAX_QP_DEPTH <= 32768,
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     nvshmemi_ibgda_device_cq_t *cq, uint64_t idx, int *error) {
     int status = 0;
-    struct mlx5_cqe64 *cqe64 = (struct mlx5_cqe64 *)cq->cqe;
-    CONSTANT_ADDRESS_SPACE nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
+    struct mlx5_cqe64 *cqes = (struct mlx5_cqe64 *)cq->cqe;
+    struct mlx5_cqe64 *cqe64;
     const uint32_t ncqes = cq->ncqes;
 
     uint8_t opown;
     uint8_t opcode;
     uint16_t wqe_counter;
-    uint16_t new_wqe_counter;
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     uint64_t start = ibgda_query_globaltimer();
@@ -513,33 +571,16 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
 #endif
 
     uint64_t cons_idx = ibgda_atomic_read(cq->cons_idx);
-    uint64_t new_cons_idx;
+    uint64_t cqe_cons_idx;
+    uint64_t slot_idx;
+    uint8_t owner_bit;
+    uint64_t completed_idx;
+    uint64_t claimed_cqe_cons_idx;
+    unsigned long long old_cqe_cons_idx;
+    bool record_target_cqe;
 
     assert(likely(cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_DCI ||
                   cq->qp_type == NVSHMEMI_IBGDA_DEVICE_QP_TYPE_RC));
-
-    if (unlikely(cons_idx >= idx)) goto out;
-
-#ifdef NVSHMEM_IBGDA_DEBUG
-    // We can skip opcode == MLX5_CQE_INVALID check because we have already
-    // initialized the CQ buffer to 0xff. With the QP depth range we enforce,
-    // cons_idx cannot progress unless wqe_counter read from the CQ buffer is
-    // a valid value.
-    do {
-        opown = ibgda_atomic_read(&cqe64->op_own);
-        opcode = opown >> 4;
-
-#ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
-        // TODO: Integrate timeout handler with the core NVSHMEM
-        now = ibgda_query_globaltimer();
-        status = ibgda_check_poll_timeout(cq, now, start, idx, error);
-        if (status != 0) goto check_opcode;
-#endif /* NVSHMEM_TIMEOUT_DEVICE_POLLING */
-    } while (unlikely(opcode == MLX5_CQE_INVALID));
-
-    // Prevent reordering of the opcode wait above
-    IBGDA_MFENCE();
-#endif /* NVSHMEM_IBGDA_DEBUG */
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
     start = ibgda_query_globaltimer();
@@ -551,44 +592,86 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
     while (unlikely(ibgda_atomic_read(cq->prod_idx) < idx));
     IBGDA_MFENCE();
 
-    do {
-        new_wqe_counter = ibgda_atomic_read(&cqe64->wqe_counter);
-        new_wqe_counter = BSWAP16(new_wqe_counter);
-#ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
-        now = ibgda_query_globaltimer();
-        status = ibgda_check_poll_timeout(cq, now, start, idx, error);
-        if (status != 0) goto check_opcode;
-
-        // Observe progress. Reset the timer.
-        if (new_wqe_counter != wqe_counter) start = now;
-#endif
-        wqe_counter = new_wqe_counter;
-
-        // Another thread may have updated cons_idx.
+    while (true) {
         cons_idx = ibgda_atomic_read(cq->cons_idx);
         if (likely(cons_idx >= idx)) goto out;
-    }
-    // NOTE: This while loop is part of do while above.
-    // wqe_counter is the HW consumer index. However, we always maintain index
-    // + 1 in SW. To be able to compare with idx, we need to use wqe_counter +
-    // 1. Because wqe_counter is uint16_t, it may wraparound. Still we know for
-    // sure that if idx - wqe_counter - 1 < ncqes, wqe_counter + 1 is less than
-    // idx, and thus we need to wait. We don't need to wait when idx ==
-    // wqe_counter + 1. That's why we use - (uint16_t)2 here to make this case
-    // wraparound.
-    while (unlikely(((uint16_t)((uint16_t)idx - wqe_counter - (uint16_t)2) < ncqes)));
 
-    // new_cons_idx is uint64_t but wqe_counter is uint16_t. Thus, we get the
-    // MSB from idx. We also need to take care of wraparound.
-    ++wqe_counter;
-    new_cons_idx =
-        (idx & ~(0xffffULL) | wqe_counter) + (((uint16_t)idx > wqe_counter) ? 0x10000ULL : 0x0);
-    atomicMax((unsigned long long int *)cq->cons_idx, (unsigned long long int)new_cons_idx);
+        cqe_cons_idx = ibgda_atomic_read(cq->cqe_cons_idx);
+        slot_idx = cqe_cons_idx % ncqes;
+        owner_bit = (uint8_t)((cqe_cons_idx / ncqes) & 0x1);
+        cqe64 = &cqes[slot_idx];
 
+        opown = ibgda_atomic_read(&cqe64->op_own);
+        if ((opown & MLX5_CQE_OWNER_MASK) != owner_bit) {
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
-check_opcode:
+            now = ibgda_query_globaltimer();
+            status = ibgda_check_poll_timeout(cq, now, start, idx, error);
+            if (status != 0) goto check_opcode;
+#endif
+            continue;
+        }
+        opcode = opown >> 4;
+        if (unlikely(opcode == MLX5_CQE_INVALID)) continue;
+        if (unlikely(opcode == MLX5_CQE_REQ_ERR)) {
+            status = -1;
+            goto check_opcode;
+        }
+
+        // Observe the CQE contents only after the owner/opcode check succeeds.
+        IBGDA_MFENCE();
+
+        wqe_counter = ibgda_atomic_read(&cqe64->wqe_counter);
+        wqe_counter = BSWAP16(wqe_counter);
+
+        cons_idx = ibgda_atomic_read(cq->cons_idx);
+        completed_idx = (cons_idx & ~(0xffffULL)) | (uint64_t)(wqe_counter + 1);
+        if ((uint16_t)completed_idx < (uint16_t)cons_idx) completed_idx += 0x10000ULL;
+        record_target_cqe = (completed_idx >= idx);
+
+        if (completed_idx > cons_idx) {
+            atomicMax((unsigned long long int *)cq->cons_idx, (unsigned long long int)completed_idx);
+        }
+
+        claimed_cqe_cons_idx = cqe_cons_idx + 1;
+        old_cqe_cons_idx = atomicCAS((unsigned long long int *)cq->cqe_cons_idx,
+                                     (unsigned long long int)cqe_cons_idx,
+                                     (unsigned long long int)claimed_cqe_cons_idx);
+        if (unlikely(old_cqe_cons_idx != cqe_cons_idx)) {
+            // A different thread consumed this CQE first. Observe the next one.
+            continue;
+        }
+
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+        bool record_this_cqe = false;
+        uint64_t prof_cqe_ts = 0;
+        uint64_t prof_now_ns = 0;
+        if (record_target_cqe && cons_idx < idx && completed_idx >= idx) {
+            record_this_cqe = true;
+            uint64_t cqe_ts_be;
+            memcpy(&cqe_ts_be, (const void *)&cqe64->timestamp, sizeof(cqe_ts_be));
+            prof_cqe_ts = BSWAP64(cqe_ts_be);
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(prof_now_ns)::"memory");
+        }
 #endif
 
+        // Tell the HCA how many CQEs we have consumed in absolute CQE space
+        // only after we have snapshotted the current CQE contents for
+        // profiling. Otherwise the slot can be reused before we read the
+        // timestamp, which makes the recorded CQE time appear spuriously new.
+        ibgda_store_release((uint32_t *)cq->dbrec,
+                            HTOBE32((uint32_t)(claimed_cqe_cons_idx & 0x00ffffffULL)));
+
+        cons_idx = ibgda_atomic_read(cq->cons_idx);
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+        if (record_this_cqe) {
+            ibgda_lat_prof_record_cqe_ts((unsigned long long)prof_cqe_ts,
+                                         (unsigned long long)prof_now_ns);
+        }
+#endif
+        if (likely(cons_idx >= idx)) goto out;
+    }
+
+check_opcode:
     // NVSHMEM always treats CQE errors as fatal.
     // Even if this error doesn't belong to the CQE in cons_idx,
     // we will just report and terminate the process.
@@ -2111,6 +2194,11 @@ template <nvshmemi_op_t channel_op, bool nbi, bool support_half_av_seg>
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
     uint64_t rptr, uint64_t lptr, size_t remaining_size, int dst_pe, int proxy_pe,
     nvshmemx_qp_handle_t qp_index = NVSHMEMX_QP_DEFAULT) {
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+    /* clock64() is per-SM; all reads in this function happen on the same SM
+       (the issuing thread does not migrate), so deltas are well-defined. */
+    unsigned long long t_prof_entry = (unsigned long long)clock64();
+#endif
     CONSTANT_ADDRESS_SPACE nvshmemi_ibgda_device_state_t *state = ibgda_get_state();
     unsigned int amask = __activemask();
     bool can_coalesce_warp = ibgda_can_coalesce_warp_pe(amask, proxy_pe);
@@ -2242,10 +2330,25 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_rma_thread(
             // Require membar.sys to push data buffer to the point of consistency.
             if (channel_op == NVSHMEMI_OP_PUT && is_data_buf_in_sysmem) __threadfence_system();
 
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+            /* WQE bytes are now written; everything from here through the
+               return of ibgda_submit_requests is "doorbell submit" time:
+               IBGDA_MEMBAR + atomicCAS spin on ready_head + ibgda_post_send
+               (lock + atomicMax prod_idx + DBR record write + BF MMIO ring). */
+            unsigned long long t_prof_pre_db = (unsigned long long)clock64();
+#endif
             if (is_qp_shared_among_ctas)
                 ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
             else
                 ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+            unsigned long long t_prof_post_db = (unsigned long long)clock64();
+            ibgda_lat_prof_record(t_prof_pre_db - t_prof_entry,
+                                  t_prof_post_db - t_prof_pre_db);
+            /* If the loop iterates again (multi-chunk transfer), measure the
+               next chunk's prep time relative to the end of this submit. */
+            t_prof_entry = t_prof_post_db;
+#endif
         }
 
         remaining_size -= transfer_size;

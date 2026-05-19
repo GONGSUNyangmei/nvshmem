@@ -19,6 +19,7 @@
 #include <stdlib.h>                                      // for free, calloc, malloc, posix...
 #include <unistd.h>                                      // for _SC_PAGESIZE
 #include <string.h>                                      // for memset, memcpy, strcmp, strstr
+#include <dlfcn.h>                                       // for dlsym, RTLD_DEFAULT
 #include <sys/types.h>                                   // for off_t
 #include <algorithm>                                     // for for_each, remove_if, max
 #include <cctype>                                        // for tolower, isspace
@@ -77,6 +78,17 @@
 #define IBGDA_IBUF_RESERVED_SLOTS 1
 
 #define IBGDA_GPAGE_BITS 16
+
+static struct ibv_context *g_ibgda_clock_info_context = nullptr;
+
+static inline uint64_t ibgda_timespec_to_ns(const struct timespec *ts) {
+    return ((uint64_t)ts->tv_sec * 1000000000ULL) + (uint64_t)ts->tv_nsec;
+}
+
+static inline int ibgda_clock_debug_enabled(void) {
+    const char *env = getenv("NVSHMEM_PERFTEST_CQE_TS_DEBUG");
+    return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
 #define IBGDA_GPAGE_SIZE (1ULL << IBGDA_GPAGE_BITS)
 #define IBGDA_GPAGE_OFF (IBGDA_GPAGE_SIZE - 1)
 #define IBGDA_GPAGE_MASK (~(IBGDA_GPAGE_OFF))
@@ -1461,6 +1473,14 @@ static int ibgda_create_cq_mobjects(nvshmemt_ibgda_state_t *ibgda_state, struct 
     status = ibgda_nic_control_alloc(&gcq->dbr_mobject, dbr_buf_size, IBGDA_GPAGE_SIZE);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot allocate dbr buf.\n");
 
+    if (gcq->dbr_mobject->has_gpu_mapping) {
+        status = cudaMemset(gcq->dbr_mobject->base.gpu_ptr, 0, gcq->dbr_mobject->base.size);
+        NVSHMEMI_NE_ERROR_JMP(status, cudaSuccess, NVSHMEMX_ERROR_INTERNAL, out,
+                              "cudaMemset failed.\n");
+    } else if (gcq->dbr_mobject->has_cpu_mapping) {
+        memset(gcq->dbr_mobject->base.cpu_ptr, 0, gcq->dbr_mobject->base.size);
+    }
+
     status = ibgda_mobject_nic_map(gcq->dbr_mobject, context, IBV_ACCESS_LOCAL_WRITE,
                                    ibgda_state->dmabuf_support_for_control_buffers);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "cannot register dbr buf.\n");
@@ -1537,7 +1557,15 @@ static int ibgda_create_cq(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_cq 
     cq_context = DEVX_ADDR_OF(create_cq_in, cmd_in, cq_context);
     DEVX_SET(cqc, cq_context, dbr_umem_valid, IBGDA_MLX5_UMEM_VALID_ENABLE);
     DEVX_SET(cqc, cq_context, cqe_sz, MLX5_CQE_SIZE_64B);
-    DEVX_SET(cqc, cq_context, cc, 0x1);  // Use collapsed CQ
+    /* Request the REAL_TIME CQE timestamp encoding so the 64-bit timestamp
+     * can be decoded directly as sec[63:32] + nsec[31:0] and compared
+     * against the GPU-side %globaltimer samples, which on this platform are
+     * already in realtime/epoch nanoseconds. */
+    DEVX_SET(cqc, cq_context, cq_timestamp_format, 2);
+    /* CQE timestamps are not available with collapsed/compressed CQEs, so
+     * keep the CQ in the normal 64B layout when CQE timestamp profiling is
+     * enabled. */
+    DEVX_SET(cqc, cq_context, cc, 0x0);
     DEVX_SET(cqc, cq_context, oi, 0x1);  // Allow overrun
     DEVX_SET(cqc, cq_context, dbr_umem_id, dbr_umem->umem_id);
     DEVX_SET(cqc, cq_context, log_cq_size, IBGDA_ILOG2_OR0(num_cqe));
@@ -1557,6 +1585,61 @@ static int ibgda_create_cq(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_cq 
     gcq->dbr_mobject = dbr_mobject;
     gcq->uar = uar;
 
+    /* Cache the mlx5 HCA core clock calibration on the first successful CQ
+     * creation. The transport is a plugin, so resolve the host-side publisher
+     * at runtime instead of relying on undefined weak-symbol binding. */
+    {
+        static bool s_clock_info_published = false;
+        g_ibgda_clock_info_context = context;
+        typedef int (*publish_context_fn_t)(const void *);
+        publish_context_fn_t publish_context =
+            (publish_context_fn_t)dlsym(RTLD_DEFAULT, "nvshmemx_ibgda_publish_mlx5_context");
+        if (publish_context != nullptr) {
+            int publish_rc = publish_context((const void *)context);
+            if (ibgda_clock_debug_enabled()) {
+                fprintf(stderr,
+                        "IBGDA_CLOCK_DEBUG publish_context fn=%p rc=%d ctx=%p\n",
+                        (void *)publish_context, publish_rc, (void *)context);
+            }
+        } else if (ibgda_clock_debug_enabled()) {
+            fprintf(stderr,
+                    "IBGDA_CLOCK_DEBUG publish_context fn missing for ctx=%p\n",
+                    (void *)context);
+        }
+        if (!s_clock_info_published) {
+            struct mlx5dv_clock_info ci;
+            memset(&ci, 0, sizeof(ci));
+            int rc = mlx5dv_get_clock_info(context, &ci);
+            if (rc == 0) {
+                typedef int (*publish_clock_info_fn_t)(const void *, size_t);
+                publish_clock_info_fn_t publish_clock_info =
+                    (publish_clock_info_fn_t)dlsym(RTLD_DEFAULT,
+                                                   "nvshmemx_ibgda_publish_mlx5_clock_info");
+                int publish_ci_rc = -1;
+                if (publish_clock_info != nullptr) {
+                    publish_ci_rc = publish_clock_info(&ci, sizeof(ci));
+                }
+                if (publish_clock_info != nullptr && publish_ci_rc == 0) {
+                    s_clock_info_published = true;
+                    if (ibgda_clock_debug_enabled()) {
+                        fprintf(stderr,
+                                "IBGDA_CLOCK_DEBUG publish_clock_info fn=%p rc=0 ctx=%p mask=%#lx\n",
+                                (void *)publish_clock_info, (void *)context,
+                                (unsigned long)ci.mask);
+                    }
+                } else if (ibgda_clock_debug_enabled()) {
+                    fprintf(stderr,
+                            "IBGDA_CLOCK_DEBUG publish_clock_info failed fn=%p ctx=%p rc=%d\n",
+                            (void *)publish_clock_info, (void *)context, publish_ci_rc);
+                }
+            } else if (ibgda_clock_debug_enabled()) {
+                fprintf(stderr,
+                        "IBGDA_CLOCK_DEBUG mlx5dv_get_clock_info rc=%d ctx=%p\n",
+                        rc, (void *)context);
+            }
+        }
+    }
+
     *pgcq = gcq;
 
 out:
@@ -1565,6 +1648,58 @@ out:
         if (gcq) free(gcq);
     }
     return status;
+}
+
+extern "C" __attribute__((visibility("default"), used)) int nvshmemi_ibgda_query_mlx5_clock_info(
+    void *out, size_t sz) {
+    if (!out || sz < sizeof(struct mlx5dv_clock_info) || g_ibgda_clock_info_context == nullptr) {
+        if (ibgda_clock_debug_enabled()) {
+            fprintf(stderr,
+                    "IBGDA_CLOCK_DEBUG transport query clock_info invalid out=%p sz=%zu ctx=%p\n",
+                    out, sz, (void *)g_ibgda_clock_info_context);
+        }
+        return EINVAL;
+    }
+
+    struct mlx5dv_clock_info ci;
+    memset(&ci, 0, sizeof(ci));
+    int rc = mlx5dv_get_clock_info(g_ibgda_clock_info_context, &ci);
+    if (rc != 0) return rc;
+
+    memcpy(out, &ci, sizeof(ci));
+    if (ibgda_clock_debug_enabled()) {
+        fprintf(stderr,
+                "IBGDA_CLOCK_DEBUG transport query clock_info rc=0 ctx=%p mask=%#lx\n",
+                (void *)g_ibgda_clock_info_context, (unsigned long)ci.mask);
+    }
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"), used)) int nvshmemi_ibgda_query_mlx5_raw_clock_ns(
+    unsigned long long *out_ns) {
+    if (!out_ns || g_ibgda_clock_info_context == nullptr) {
+        if (ibgda_clock_debug_enabled()) {
+            fprintf(stderr,
+                    "IBGDA_CLOCK_DEBUG transport query raw_clock invalid out=%p ctx=%p\n",
+                    (void *)out_ns, (void *)g_ibgda_clock_info_context);
+        }
+        return EINVAL;
+    }
+
+    struct ibv_values_ex values;
+    memset(&values, 0, sizeof(values));
+    values.comp_mask = IBV_VALUES_MASK_RAW_CLOCK;
+
+    int rc = ibv_query_rt_values_ex(g_ibgda_clock_info_context, &values);
+    if (rc != 0) return rc;
+
+    *out_ns = ibgda_timespec_to_ns(&values.raw_clock);
+    if (ibgda_clock_debug_enabled()) {
+        fprintf(stderr,
+                "IBGDA_CLOCK_DEBUG transport query raw_clock rc=0 ctx=%p now_ns=%llu\n",
+                (void *)g_ibgda_clock_info_context, (unsigned long long)*out_ns);
+    }
+    return 0;
 }
 
 static void ibgda_destroy_cq(struct ibgda_cq *gcq) {
@@ -2464,7 +2599,7 @@ static int ibgda_create_dct(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep
 
     dv_init_attr.comp_mask = MLX5DV_QP_INIT_ATTR_MASK_DC;
     dv_init_attr.dc_init_attr.dc_type = MLX5DV_DCTYPE_DCT;
-    dv_init_attr.dc_init_attr.dct_access_key = IBGDA_DC_ACCESS_KEY;
+    dv_init_attr.dc_init_attr.dct_access_key =  IBGDA_DC_ACCESS_KEY;
 
     ib_qp_attr_ex.pd = device->dct.pd;
     ib_qp_attr_ex.comp_mask = IBV_QP_INIT_ATTR_PD;
@@ -2913,6 +3048,8 @@ static int ibgda_populate_dci_gpu_data(nvshmemt_ibgda_state_t *ibgda_state, nvsh
     const size_t mvars_offset = offsetof(nvshmemi_ibgda_device_qp_t, mvars);
     const size_t prod_idx_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.prod_idx);
     const size_t cons_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.cons_idx);
+    const size_t cqe_cons_offset =
+        offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.cqe_cons_idx);
     const size_t wqe_h_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.resv_head);
     const size_t wqe_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.ready_head);
 
@@ -2931,6 +3068,7 @@ static int ibgda_populate_dci_gpu_data(nvshmemt_ibgda_state_t *ibgda_state, nvsh
                   cq_idx);
 
             ibgda_get_device_cq(&cq_h[cq_idx], device->dci.eps[i]->send_cq);
+            cq_h[cq_idx].cqe_cons_idx = (uint64_t *)(base_mvars_d_addr + cqe_cons_offset);
             cq_h[cq_idx].cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_offset);
             cq_h[cq_idx].resv_head = (uint64_t *)(base_mvars_d_addr + wqe_h_offset);
             cq_h[cq_idx].ready_head = (uint64_t *)(base_mvars_d_addr + wqe_t_offset);
@@ -3179,6 +3317,8 @@ static int ibgda_populate_rc_gpu_data(nvshmemt_ibgda_state_t *ibgda_state, nvshm
     const size_t mvars_offset = offsetof(nvshmemi_ibgda_device_qp_t, mvars);
     const size_t prod_idx_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.prod_idx);
     const size_t cons_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.cons_idx);
+    const size_t cqe_cons_offset =
+        offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.cqe_cons_idx);
     const size_t wqe_h_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.resv_head);
     const size_t wqe_t_offset = offsetof(nvshmemi_ibgda_device_qp_management_t, tx_wq.ready_head);
 
@@ -3212,6 +3352,7 @@ static int ibgda_populate_rc_gpu_data(nvshmemt_ibgda_state_t *ibgda_state, nvshm
 
                 rc_h[qp_index].tx_wq.cq = &cq_d[my_cq_index];
                 ibgda_get_device_cq(&cq_h[my_cq_index], ep->send_cq);
+                cq_h[my_cq_index].cqe_cons_idx = (uint64_t *)(base_mvars_d_addr + cqe_cons_offset);
                 cq_h[my_cq_index].cons_idx = (uint64_t *)(base_mvars_d_addr + cons_t_offset);
                 cq_h[my_cq_index].resv_head = (uint64_t *)(base_mvars_d_addr + wqe_h_offset);
                 cq_h[my_cq_index].ready_head = (uint64_t *)(base_mvars_d_addr + wqe_t_offset);

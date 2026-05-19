@@ -1,4 +1,6 @@
 {
   global: nvshmemt_init;
+          nvshmemi_ibgda_query_mlx5_clock_info;
+          nvshmemi_ibgda_query_mlx5_raw_clock_ns;
   local: *;
 };

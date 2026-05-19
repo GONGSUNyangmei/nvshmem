@@ -28,6 +28,7 @@
     do {                                                             \
         cq.version = (1 << 16) + sizeof(nvshmemi_ibgda_device_cq_t); \
         cq.cqe = NULL;                                               \
+        cq.cqe_cons_idx = NULL;                                      \
         cq.prod_idx = NULL;                                          \
         cq.cons_idx = NULL;                                          \
         cq.resv_head = NULL;                                         \
@@ -46,6 +47,7 @@
         qp_man.tx_wq.ready_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                  \
         qp_man.tx_wq.prod_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.tx_wq.cons_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
+        qp_man.tx_wq.cqe_cons_idx = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                \
         qp_man.tx_wq.get_head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.tx_wq.get_tail = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                    \
         qp_man.ibuf.head = NVSHMEMI_IBGDA_ULSCALAR_INVALID;                         \
@@ -144,6 +146,7 @@ typedef struct {
     nvshmemi_ibgda_device_qp_type_t qp_type;
     __be32 *dbrec;
     void *cqe;
+    uint64_t *cqe_cons_idx;
     uint64_t *prod_idx;
     uint64_t *cons_idx;
     uint64_t *resv_head;
@@ -152,7 +155,7 @@ typedef struct {
     uint32_t ncqes;
     uint32_t qpn;
 } nvshmemi_ibgda_device_cq_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_cq_v1) == 72, "ibgda_device_cq_v1 must be 72 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_cq_v1) == 80, "ibgda_device_cq_v1 must be 80 bytes.");
 
 typedef nvshmemi_ibgda_device_cq_v1 nvshmemi_ibgda_device_cq_t;
 
@@ -167,6 +170,7 @@ typedef struct {
         uint64_t ready_head;  // last ready wqe idx + 1
         uint64_t prod_idx;    // posted wqe idx + 1 (producer index + 1)
         uint64_t cons_idx;    // polled wqe idx + 1 (consumer index + 1)
+        uint64_t cqe_cons_idx;  // consumed CQE count
         uint64_t get_head;    // last wqe idx + 1 with a "fetch" operation (g, get, amo_fetch)
         uint64_t get_tail;    // last wqe idx + 1 polled with cst; get_tail > get_head is possible
     } tx_wq;
@@ -176,8 +180,8 @@ typedef struct {
     } ibuf;
     char padding[NVSHMEMI_IBGDA_QP_MANAGEMENT_PADDING];
 } __attribute__((__aligned__(8))) nvshmemi_ibgda_device_qp_management_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 96,
-              "ibgda_device_qp_management_v1 must be 96 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_management_v1) == 104,
+              "ibgda_device_qp_management_v1 must be 104 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_management_v1 nvshmemi_ibgda_device_qp_management_t;
 
@@ -203,7 +207,7 @@ typedef struct nvshmemi_ibgda_device_qp {
     } tx_wq;
     nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
 } nvshmemi_ibgda_device_qp_v1;
-static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 184, "ibgda_device_qp_v1 must be 184 bytes.");
+static_assert(sizeof(nvshmemi_ibgda_device_qp_v1) == 192, "ibgda_device_qp_v1 must be 192 bytes.");
 
 typedef nvshmemi_ibgda_device_qp_v1 nvshmemi_ibgda_device_qp_t;
 

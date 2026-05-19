@@ -531,6 +531,12 @@ endif()
 
 if(NVSHMEM_IBDEVX_SUPPORT OR NVSHMEM_IBGDA_SUPPORT)
   find_library(MLX5_lib NAMES mlx5)
+  if(MLX5_lib)
+    # nvshmem_device is imported from the device subproject as a static archive.
+    # Its host-side IBGDA clock helpers call into libmlx5, so in-tree consumers
+    # must see that dependency on their final link lines.
+    set_property(TARGET nvshmem_device APPEND PROPERTY INTERFACE_LINK_LIBRARIES ${MLX5_lib})
+  endif()
 endif()
 
 if(NVSHMEM_IBDEVX_SUPPORT)
@@ -741,6 +747,7 @@ set(INC_EXPORTS
     host/nvshmem_macros.h
     host/nvshmemx_api.h
     host/nvshmemx_coll_api.h
+    host/nvshmemx_ibgda_lat_profile.h
     non_abi/nvshmemx_error.h
     non_abi/nvshmem_build_options.h
     non_abi/nvshmem_version.h

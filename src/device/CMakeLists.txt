@@ -42,6 +42,7 @@ project(
 
 find_package(CUDAToolkit)
 find_package(CCCL PATHS ${CUDAToolkit_LIBRARY_DIR}/cmake/cccl)
+find_library(MLX5_lib NAMES mlx5)
 message(STATUS "CUDAToolkit_LIBRARY_DIR: ${CUDAToolkit_LIBRARY_DIR}")
 
 if(DEFINED CMAKE_CUDA_ARCHITECTURES_UNDEFINED)
@@ -184,6 +185,11 @@ else()
 endif()
 
 target_link_libraries(nvshmem_device PRIVATE CUDA::cudart_static)
+if(MLX5_lib)
+  # init_device.cu exports host-side IBGDA clock helpers that call into libmlx5.
+  # Propagate this dependency so installed consumers resolve mlx5dv_get_clock_info.
+  target_link_libraries(nvshmem_device PUBLIC ${MLX5_lib})
+endif()
 if (CCCL_FOUND AND CUDAToolkit_VERSION_MAJOR GREATER 12)
   target_link_libraries(nvshmem_device PUBLIC CCCL::CCCL)
 endif()
