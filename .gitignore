@@ -106,3 +106,8 @@ nvshmem4py/nvshmem/bindings/device/cute/entry_point.h
 # Filesystem objects
 .DS_STORE
 .nfs*
+
+/build-cqe-ts 
+/install-cqe-ts 
+/perftest/build-cqe-ts
+

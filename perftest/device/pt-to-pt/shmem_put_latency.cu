@@ -254,6 +254,7 @@ typedef struct gpu_raw_clock_calibration_s {
     unsigned long long gpu_ref;
     long double raw_ref_ns;
     long double raw_per_gpu_tick_ns;
+    /* Conservative NIC raw-clock <-> GPU %globaltimer sync error bound, in ns. */
     uint64_t fit_error_ns;
 } gpu_raw_clock_calibration_t;
 
@@ -701,6 +702,7 @@ int main(int argc, char *argv[]) {
      * calibration is too noisy to trust. */
     double *h_cqe2gpu_avg_ns = NULL;
     double *h_cqe2gpu_max_ns = NULL;
+    double *h_nic_gpu_sync_precision_ns = NULL;
     nvshmemx_ibgda_cqe_ts_pair_t *h_cqe_ts_pairs = NULL;
 
     /* Declared (without initializers) above any `goto finalize` so C++'s
@@ -753,6 +755,7 @@ int main(int argc, char *argv[]) {
 
     h_cqe2gpu_avg_ns = (double *)calloc(array_size, sizeof(double));
     h_cqe2gpu_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_nic_gpu_sync_precision_ns = (double *)calloc(array_size, sizeof(double));
     /* Up to `iter` pairs per measurement; allocate enough for the largest
      * expected sample. */
     h_cqe_ts_pairs =
@@ -801,6 +804,30 @@ int main(int argc, char *argv[]) {
             cudaEventElapsedTime(&milliseconds, start, stop);
             h_lat[i] = (milliseconds * 1000) / iter;
 
+            gpu_raw_clock_calibration_t gpu_raw_calib;
+            memset(&gpu_raw_calib, 0, sizeof(gpu_raw_calib));
+            gpu_raw_calib.raw_per_gpu_tick_ns = 1.0L;
+            gpu_raw_calib.fit_error_ns = UINT64_MAX;
+            int calib_status = cudaErrorInvalidValue;
+
+            if (calib_stream) {
+                calib_status =
+                    calibrate_gpu_globaltimer_to_raw_ns(calib_stream, &gpu_raw_calib);
+            }
+
+            const char *debug_cqe_ts = getenv("NVSHMEM_PERFTEST_CQE_TS_DEBUG");
+            if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
+                printf("CQE_TS_DEBUG size=%d calib_status=%d gpu_ref=%llu gpu_raw_ref_ns=%0.3Lf gpu_tick_ns=%0.12Lf nic_gpu_sync_precision_ns=%llu\n",
+                       size, calib_status,
+                       (unsigned long long)gpu_raw_calib.gpu_ref,
+                       gpu_raw_calib.raw_ref_ns,
+                       gpu_raw_calib.raw_per_gpu_tick_ns,
+                       (unsigned long long)gpu_raw_calib.fit_error_ns);
+            }
+            if (calib_status == 0 && gpu_raw_calib.fit_error_ns != UINT64_MAX) {
+                h_nic_gpu_sync_precision_ns[i] = (double)gpu_raw_calib.fit_error_ns;
+            }
+
             /* Snapshot the IBGDA WQE-prep / doorbell-submit cycle counters
              * accumulated by ibgda_rma_thread during this measurement. */
             nvshmemx_ibgda_lat_profile_t prof;
@@ -823,7 +850,6 @@ int main(int argc, char *argv[]) {
             if (h_cqe_ts_pairs && iter > 0) {
                 int ts_status = nvshmemx_ibgda_lat_profile_cqe_ts_get(
                     h_cqe_ts_pairs, (size_t)iter, &pair_count);
-                const char *debug_cqe_ts = getenv("NVSHMEM_PERFTEST_CQE_TS_DEBUG");
                 if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
                     printf("CQE_TS_DEBUG size=%d ts_status=%d pair_count=%zu ci.mask=%#lx\n",
                            size, ts_status, pair_count, (unsigned long)ci.mask);
@@ -844,25 +870,6 @@ int main(int argc, char *argv[]) {
                                (unsigned long long)ci.last_cycles,
                                (unsigned long long)ci.frac, ci.mult, ci.shift,
                                (unsigned long)ci.mask, raw_clock_status, raw_clock_ns);
-                    }
-
-                    gpu_raw_clock_calibration_t gpu_raw_calib;
-                    memset(&gpu_raw_calib, 0, sizeof(gpu_raw_calib));
-                    gpu_raw_calib.raw_per_gpu_tick_ns = 1.0L;
-                    gpu_raw_calib.fit_error_ns = UINT64_MAX;
-                    int calib_status = cudaErrorInvalidValue;
-
-                    if (calib_stream) {
-                        calib_status =
-                            calibrate_gpu_globaltimer_to_raw_ns(calib_stream, &gpu_raw_calib);
-                    }
-                    if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
-                        printf("CQE_TS_DEBUG size=%d calib_status=%d gpu_ref=%llu gpu_raw_ref_ns=%0.3Lf gpu_tick_ns=%0.12Lf gpu_fit_error_ns=%llu\n",
-                               size, calib_status,
-                               (unsigned long long)gpu_raw_calib.gpu_ref,
-                               gpu_raw_calib.raw_ref_ns,
-                               gpu_raw_calib.raw_per_gpu_tick_ns,
-                               (unsigned long long)gpu_raw_calib.fit_error_ns);
                     }
                     if (calib_status == 0) {
                         long double sum_ns = 0.0L;
@@ -957,6 +964,9 @@ int main(int argc, char *argv[]) {
         print_table_basic("shmem_put_latency_cqe_to_thread", "max",
                           "size (Bytes)", "nic_cqe_to_gpu_max", "ns", '-',
                           h_size_arr, h_cqe2gpu_max_ns, i);
+        print_table_basic("shmem_put_latency_nic_gpu_clock_sync", "precision",
+                          "size (Bytes)", "nic_gpu_sync_precision", "ns", '-',
+                          h_size_arr, h_nic_gpu_sync_precision_ns, i);
     }
 
     i = 0;
@@ -1037,6 +1047,7 @@ finalize:
 
     free(h_cqe2gpu_avg_ns);
     free(h_cqe2gpu_max_ns);
+    free(h_nic_gpu_sync_precision_ns);
     free(h_cqe_ts_pairs);
 
     finalize_wrapper();
