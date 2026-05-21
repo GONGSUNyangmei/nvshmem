@@ -2358,6 +2358,11 @@ static int ibgda_create_qp(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep 
     DEVX_SET(qpc, qp_context, srqn_rmpn_xrqn, device->qp_shared_object.srqn);
     DEVX_SET(qpc, qp_context, cqn_snd, send_cq->cqn);
     DEVX_SET(qpc, qp_context, cqn_rcv, device->qp_shared_object.rcqn);
+    /* Match the CQ REAL_TIME timestamp request when the HCA accepts it. Some
+     * QP types/firmware revisions reject this QPC field even when the CQ
+     * timestamp format field is accepted, so creation below falls back to
+     * free-running timestamps if needed. */
+    DEVX_SET(qpc, qp_context, ts_format, MLX5_QPC_TIMESTAMP_FORMAT_REAL_TIME);
     DEVX_SET(qpc, qp_context, log_sq_size, IBGDA_ILOG2_OR0(num_wqebb));
     DEVX_SET(qpc, qp_context, log_rq_size, 0);
     DEVX_SET(qpc, qp_context, cs_req, 0);                                     // Disable CS Request
@@ -2372,6 +2377,20 @@ static int ibgda_create_qp(nvshmemt_ibgda_state_t *ibgda_state, struct ibgda_ep 
     DEVX_SET(qpc, qp_context, page_offset, 0);
 
     ep->devx_qp = mlx5dv_devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+    if (ep->devx_qp == nullptr) {
+        int real_time_errno = errno;
+
+        DEVX_SET(qpc, qp_context, ts_format, MLX5_QPC_TIMESTAMP_FORMAT_FREE_RUNNING);
+        memset(cmd_out, 0, sizeof(cmd_out));
+        ep->devx_qp =
+            mlx5dv_devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+        if (ep->devx_qp != nullptr && ibgda_clock_debug_enabled()) {
+            fprintf(stderr,
+                    "IBGDA_CLOCK_DEBUG create_qp realtime ts_format rejected errno=%d; "
+                    "falling back to free-running ts_format\n",
+                    real_time_errno);
+        }
+    }
     NVSHMEMI_NULL_ERROR_JMP(ep->devx_qp, status, NVSHMEMX_ERROR_INTERNAL, out,
                             "Unable to create QP for EP.\n");
 
