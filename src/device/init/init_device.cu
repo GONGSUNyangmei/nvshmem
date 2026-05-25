@@ -61,12 +61,20 @@ __device__ __attribute__((used)) unsigned long long nvshmemi_ibgda_lat_prof_coun
    NVSHMEM_IBGDA_LAT_PROFILE. The buffers themselves are host-allocated
    (cudaMalloc) and published via cudaMemcpyToSymbol from
    nvshmemx_ibgda_lat_profile_cqe_ts_reset(); the slot count cap is also
-   pushed once. The device-side recorder writes (cqe_ts_cycles, gpu_now_ns)
-   pairs into matching slots while count < cap. */
+   pushed once. The device-side recorder writes (completed_idx, cqe_ts_cycles,
+   gpu_now_ns) tuples into matching slots while count < cap. */
+__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_cqe_completed_idx_buf =
+    nullptr;
 __device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_cqe_ts_buf  = nullptr;
 __device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_gpu_ns_buf  = nullptr;
 __device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_cqe_ts_cap   = 0;
 __device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_cqe_ts_count = 0;
+
+__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_prod_idx_buf = nullptr;
+__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_before_buf   = nullptr;
+__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_after_buf    = nullptr;
+__device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_db_ts_cap       = 0;
+__device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_db_ts_count     = 0;
 
 /* Host-published mlx5dv_clock_info, populated by the IBGDA transport via
    nvshmemx_ibgda_publish_mlx5_clock_info() the first time a CQ is created.
@@ -334,9 +342,14 @@ int nvshmemx_ibgda_lat_profile_reset(void) {
 /*  NVSHMEM_IBGDA_CQE_TS_BUF_CAP.                                     */
 /* ------------------------------------------------------------------ */
 
-static unsigned long long *s_cqe_ts_dev_buf  = nullptr;
-static unsigned long long *s_gpu_ns_dev_buf  = nullptr;
-static size_t              s_cqe_ts_cap      = 0;
+static unsigned long long *s_cqe_completed_idx_dev_buf = nullptr;
+static unsigned long long *s_cqe_ts_dev_buf            = nullptr;
+static unsigned long long *s_gpu_ns_dev_buf            = nullptr;
+static size_t              s_cqe_ts_cap                = 0;
+static unsigned long long *s_db_prod_idx_dev_buf       = nullptr;
+static unsigned long long *s_db_before_dev_buf         = nullptr;
+static unsigned long long *s_db_after_dev_buf          = nullptr;
+static size_t              s_db_ts_cap                 = 0;
 static struct ibv_context *s_ibgda_host_context = nullptr;
 
 typedef int (*nvshmemi_ibgda_transport_query_clock_info_fn_t)(void *out, size_t sz);
@@ -422,8 +435,21 @@ static int nvshmemi_ibgda_query_mlx5_raw_clock_ns_from_transport(unsigned long l
     return rc;
 }
 
+static void nvshmemi_ibgda_cqe_ts_buf_clear(void) {
+    cudaFree(s_cqe_completed_idx_dev_buf);
+    cudaFree(s_cqe_ts_dev_buf);
+    cudaFree(s_gpu_ns_dev_buf);
+    s_cqe_completed_idx_dev_buf = nullptr;
+    s_cqe_ts_dev_buf = nullptr;
+    s_gpu_ns_dev_buf = nullptr;
+    s_cqe_ts_cap = 0;
+}
+
 static int nvshmemi_ibgda_cqe_ts_buf_ensure(void) {
-    if (s_cqe_ts_dev_buf && s_gpu_ns_dev_buf && s_cqe_ts_cap > 0) return 0;
+    if (s_cqe_completed_idx_dev_buf && s_cqe_ts_dev_buf && s_gpu_ns_dev_buf &&
+        s_cqe_ts_cap > 0) {
+        return 0;
+    }
 
     size_t cap = 65536;
     const char *env = getenv("NVSHMEM_IBGDA_CQE_TS_BUF_CAP");
@@ -434,30 +460,61 @@ static int nvshmemi_ibgda_cqe_ts_buf_ensure(void) {
     }
 
     cudaError_t err;
-    err = cudaMalloc((void **)&s_cqe_ts_dev_buf, cap * sizeof(unsigned long long));
+    err = cudaMalloc((void **)&s_cqe_completed_idx_dev_buf, cap * sizeof(unsigned long long));
     if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void **)&s_cqe_ts_dev_buf, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
     err = cudaMalloc((void **)&s_gpu_ns_dev_buf, cap * sizeof(unsigned long long));
     if (err != cudaSuccess) {
-        cudaFree(s_cqe_ts_dev_buf);
-        s_cqe_ts_dev_buf = nullptr;
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemset(s_cqe_completed_idx_dev_buf, 0, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
         return (int)err;
     }
     err = cudaMemset(s_cqe_ts_dev_buf, 0, cap * sizeof(unsigned long long));
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
     err = cudaMemset(s_gpu_ns_dev_buf, 0, cap * sizeof(unsigned long long));
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
 
+    err = cudaMemcpyToSymbol(nvshmemi_ibgda_cqe_completed_idx_buf,
+                             &s_cqe_completed_idx_dev_buf,
+                             sizeof(s_cqe_completed_idx_dev_buf), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
     err = cudaMemcpyToSymbol(nvshmemi_ibgda_cqe_ts_buf, &s_cqe_ts_dev_buf,
                              sizeof(s_cqe_ts_dev_buf), 0, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
     err = cudaMemcpyToSymbol(nvshmemi_ibgda_gpu_ns_buf, &s_gpu_ns_dev_buf,
                              sizeof(s_gpu_ns_dev_buf), 0, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
 
     unsigned long long cap_dev = (unsigned long long)cap;
     err = cudaMemcpyToSymbol(nvshmemi_ibgda_cqe_ts_cap, &cap_dev, sizeof(cap_dev), 0,
                              cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_cqe_ts_buf_clear();
+        return (int)err;
+    }
 
     s_cqe_ts_cap = cap;
     return 0;
@@ -478,7 +535,9 @@ int nvshmemx_ibgda_lat_profile_cqe_ts_get(nvshmemx_ibgda_cqe_ts_pair_t *out, siz
                                           size_t *out_count) {
     if (out_count) *out_count = 0;
     if (!out || max_pairs == 0) return (int)cudaErrorInvalidValue;
-    if (!s_cqe_ts_dev_buf || !s_gpu_ns_dev_buf || s_cqe_ts_cap == 0) return 0;
+    if (!s_cqe_completed_idx_dev_buf || !s_cqe_ts_dev_buf || !s_gpu_ns_dev_buf ||
+        s_cqe_ts_cap == 0)
+        return 0;
 
     unsigned long long count_dev = 0;
     cudaError_t err = cudaMemcpyFromSymbol(&count_dev, nvshmemi_ibgda_cqe_ts_count,
@@ -490,17 +549,29 @@ int nvshmemx_ibgda_lat_profile_cqe_ts_get(nvshmemx_ibgda_cqe_ts_pair_t *out, siz
     if (n > max_pairs) n = max_pairs;
     if (n == 0) return 0;
 
+    unsigned long long *tmp_completed =
+        (unsigned long long *)malloc(n * sizeof(unsigned long long));
     unsigned long long *tmp_cqe = (unsigned long long *)malloc(n * sizeof(unsigned long long));
     unsigned long long *tmp_gpu = (unsigned long long *)malloc(n * sizeof(unsigned long long));
-    if (!tmp_cqe || !tmp_gpu) {
+    if (!tmp_completed || !tmp_cqe || !tmp_gpu) {
+        free(tmp_completed);
         free(tmp_cqe);
         free(tmp_gpu);
         return (int)cudaErrorMemoryAllocation;
     }
 
+    err = cudaMemcpy(tmp_completed, s_cqe_completed_idx_dev_buf, n * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        free(tmp_completed);
+        free(tmp_cqe);
+        free(tmp_gpu);
+        return (int)err;
+    }
     err = cudaMemcpy(tmp_cqe, s_cqe_ts_dev_buf, n * sizeof(unsigned long long),
                      cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
+        free(tmp_completed);
         free(tmp_cqe);
         free(tmp_gpu);
         return (int)err;
@@ -508,17 +579,181 @@ int nvshmemx_ibgda_lat_profile_cqe_ts_get(nvshmemx_ibgda_cqe_ts_pair_t *out, siz
     err = cudaMemcpy(tmp_gpu, s_gpu_ns_dev_buf, n * sizeof(unsigned long long),
                      cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
+        free(tmp_completed);
         free(tmp_cqe);
         free(tmp_gpu);
         return (int)err;
     }
 
     for (size_t i = 0; i < n; ++i) {
+        out[i].completed_idx = tmp_completed[i];
         out[i].cqe_ts_cycles = tmp_cqe[i];
         out[i].gpu_now_ns    = tmp_gpu[i];
     }
+    free(tmp_completed);
     free(tmp_cqe);
     free(tmp_gpu);
+
+    if (out_count) *out_count = n;
+    return 0;
+}
+
+static void nvshmemi_ibgda_db_ts_buf_clear(void) {
+    cudaFree(s_db_prod_idx_dev_buf);
+    cudaFree(s_db_before_dev_buf);
+    cudaFree(s_db_after_dev_buf);
+    s_db_prod_idx_dev_buf = nullptr;
+    s_db_before_dev_buf = nullptr;
+    s_db_after_dev_buf = nullptr;
+    s_db_ts_cap = 0;
+}
+
+static int nvshmemi_ibgda_db_ts_buf_ensure(void) {
+    if (s_db_prod_idx_dev_buf && s_db_before_dev_buf && s_db_after_dev_buf &&
+        s_db_ts_cap > 0) {
+        return 0;
+    }
+
+    size_t cap = 65536;
+    const char *env = getenv("NVSHMEM_IBGDA_DB_TS_BUF_CAP");
+    if (env && *env) {
+        char *end = nullptr;
+        unsigned long v = strtoul(env, &end, 0);
+        if (end != env && v > 0) cap = (size_t)v;
+    }
+
+    cudaError_t err;
+    err = cudaMalloc((void **)&s_db_prod_idx_dev_buf, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void **)&s_db_before_dev_buf, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMalloc((void **)&s_db_after_dev_buf, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemset(s_db_prod_idx_dev_buf, 0, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemset(s_db_before_dev_buf, 0, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemset(s_db_after_dev_buf, 0, cap * sizeof(unsigned long long));
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+
+    err = cudaMemcpyToSymbol(nvshmemi_ibgda_db_prod_idx_buf, &s_db_prod_idx_dev_buf,
+                             sizeof(s_db_prod_idx_dev_buf), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemcpyToSymbol(nvshmemi_ibgda_db_before_buf, &s_db_before_dev_buf,
+                             sizeof(s_db_before_dev_buf), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+    err = cudaMemcpyToSymbol(nvshmemi_ibgda_db_after_buf, &s_db_after_dev_buf,
+                             sizeof(s_db_after_dev_buf), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+
+    unsigned long long cap_dev = (unsigned long long)cap;
+    err = cudaMemcpyToSymbol(nvshmemi_ibgda_db_ts_cap, &cap_dev, sizeof(cap_dev), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        nvshmemi_ibgda_db_ts_buf_clear();
+        return (int)err;
+    }
+
+    s_db_ts_cap = cap;
+    return 0;
+}
+
+int nvshmemx_ibgda_lat_profile_db_ts_reset(void) {
+    int rc = nvshmemi_ibgda_db_ts_buf_ensure();
+    if (rc) return rc;
+
+    const unsigned long long zero = 0;
+    cudaError_t err = cudaMemcpyToSymbol(nvshmemi_ibgda_db_ts_count, &zero, sizeof(zero), 0,
+                                         cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    return 0;
+}
+
+int nvshmemx_ibgda_lat_profile_db_ts_get(nvshmemx_ibgda_db_ts_pair_t *out, size_t max_pairs,
+                                         size_t *out_count) {
+    if (out_count) *out_count = 0;
+    if (!out || max_pairs == 0) return (int)cudaErrorInvalidValue;
+    if (!s_db_prod_idx_dev_buf || !s_db_before_dev_buf || !s_db_after_dev_buf ||
+        s_db_ts_cap == 0)
+        return 0;
+
+    unsigned long long count_dev = 0;
+    cudaError_t err = cudaMemcpyFromSymbol(&count_dev, nvshmemi_ibgda_db_ts_count,
+                                           sizeof(count_dev), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+
+    size_t n = (size_t)count_dev;
+    if (n > s_db_ts_cap) n = s_db_ts_cap;
+    if (n > max_pairs) n = max_pairs;
+    if (n == 0) return 0;
+
+    unsigned long long *tmp_prod = (unsigned long long *)malloc(n * sizeof(unsigned long long));
+    unsigned long long *tmp_before = (unsigned long long *)malloc(n * sizeof(unsigned long long));
+    unsigned long long *tmp_after = (unsigned long long *)malloc(n * sizeof(unsigned long long));
+    if (!tmp_prod || !tmp_before || !tmp_after) {
+        free(tmp_prod);
+        free(tmp_before);
+        free(tmp_after);
+        return (int)cudaErrorMemoryAllocation;
+    }
+
+    err = cudaMemcpy(tmp_prod, s_db_prod_idx_dev_buf, n * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        free(tmp_prod);
+        free(tmp_before);
+        free(tmp_after);
+        return (int)err;
+    }
+    err = cudaMemcpy(tmp_before, s_db_before_dev_buf, n * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        free(tmp_prod);
+        free(tmp_before);
+        free(tmp_after);
+        return (int)err;
+    }
+    err = cudaMemcpy(tmp_after, s_db_after_dev_buf, n * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        free(tmp_prod);
+        free(tmp_before);
+        free(tmp_after);
+        return (int)err;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        out[i].prod_idx = tmp_prod[i];
+        out[i].db_before_gpu_ns = tmp_before[i];
+        out[i].db_after_gpu_ns = tmp_after[i];
+    }
+    free(tmp_prod);
+    free(tmp_before);
+    free(tmp_after);
 
     if (out_count) *out_count = n;
     return 0;
@@ -608,6 +843,14 @@ int nvshmemx_ibgda_lat_profile_reset(void) { return 0; }
 int nvshmemx_ibgda_lat_profile_cqe_ts_reset(void) { return 0; }
 int nvshmemx_ibgda_lat_profile_cqe_ts_get(nvshmemx_ibgda_cqe_ts_pair_t *out, size_t max_pairs,
                                           size_t *out_count) {
+    (void)out;
+    (void)max_pairs;
+    if (out_count) *out_count = 0;
+    return 0;
+}
+int nvshmemx_ibgda_lat_profile_db_ts_reset(void) { return 0; }
+int nvshmemx_ibgda_lat_profile_db_ts_get(nvshmemx_ibgda_db_ts_pair_t *out, size_t max_pairs,
+                                         size_t *out_count) {
     (void)out;
     (void)max_pairs;
     if (out_count) *out_count = 0;

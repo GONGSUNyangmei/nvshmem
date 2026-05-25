@@ -88,11 +88,22 @@ int nvshmemx_ibgda_lat_profile_reset(void);
 /*  to align with %globaltimer for an absolute ns delta.              */
 /* ------------------------------------------------------------------ */
 typedef struct nvshmemx_ibgda_cqe_ts_pair_s {
+    /* Full completed WQE index represented by the CQE. */
+    unsigned long long completed_idx;
     /* HCA HW cycles from cqe64->timestamp (host-endian, FREE_RUNNING). */
     unsigned long long cqe_ts_cycles;
     /* GPU %globaltimer ns when the GPU thread observed the CQE. */
     unsigned long long gpu_now_ns;
 } nvshmemx_ibgda_cqe_ts_pair_t;
+
+typedef struct nvshmemx_ibgda_db_ts_pair_s {
+    /* Full producer index passed to ibgda_post_send(), not the low 16 bits. */
+    unsigned long long prod_idx;
+    /* GPU %globaltimer ns immediately before the real doorbell store. */
+    unsigned long long db_before_gpu_ns;
+    /* GPU %globaltimer ns immediately after the real doorbell store. */
+    unsigned long long db_after_gpu_ns;
+} nvshmemx_ibgda_db_ts_pair_t;
 
 /* Snapshot up to max_pairs most recent pairs into out[]. On success returns
  * 0 and writes the number of pairs actually copied to *out_count (or 0 if
@@ -100,10 +111,15 @@ typedef struct nvshmemx_ibgda_cqe_ts_pair_s {
 int nvshmemx_ibgda_lat_profile_cqe_ts_get(nvshmemx_ibgda_cqe_ts_pair_t *out,
                                           size_t max_pairs, size_t *out_count);
 
+int nvshmemx_ibgda_lat_profile_db_ts_get(nvshmemx_ibgda_db_ts_pair_t *out,
+                                         size_t max_pairs, size_t *out_count);
+
 /* Lazily allocate (cap from NVSHMEM_IBGDA_CQE_TS_BUF_CAP env, default 64K
  * pairs) the device ring buffer and zero the recorded count. Must be
  * called at least once before the GPU starts recording. */
 int nvshmemx_ibgda_lat_profile_cqe_ts_reset(void);
+
+int nvshmemx_ibgda_lat_profile_db_ts_reset(void);
 
 /* Copy the cached mlx5dv_clock_info captured by the IBGDA transport into
  * *out. *out must point at a struct mlx5dv_clock_info (the header avoids

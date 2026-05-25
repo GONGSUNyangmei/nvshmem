@@ -35,19 +35,55 @@
 #define NSEC_PER_SEC 1000000000ULL
 #define CQE_REALTIME_SEC_WINDOW 3600ULL
 
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_put_cycles_sum = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_put_cycles_max = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_quiet_cycles_sum = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_quiet_cycles_max = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_loop_cycles_sum = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_loop_cycles_max = 0;
+__device__ __attribute__((used)) unsigned long long shmem_put_latency_api_prof_count = 0;
+
 #if defined __cplusplus || defined NVSHMEM_HOSTLIB_ONLY
 extern "C" {
 #endif
 
 __global__ void latency_kern(int *data_d, int len, int pe, int iter) {
     int i, peer;
+    unsigned long long put_cycles_sum = 0;
+    unsigned long long put_cycles_max = 0;
+    unsigned long long quiet_cycles_sum = 0;
+    unsigned long long quiet_cycles_max = 0;
+    unsigned long long loop_cycles_sum = 0;
+    unsigned long long loop_cycles_max = 0;
 
     peer = !pe;
 
     for (i = 0; i < iter; i++) {
+        unsigned long long t_loop_start = (unsigned long long)clock64();
         nvshmem_int_put_nbi(data_d, data_d, len, peer);
+        unsigned long long t_after_put = (unsigned long long)clock64();
         nvshmem_quiet();
+        unsigned long long t_after_quiet = (unsigned long long)clock64();
+
+        unsigned long long put_cycles = t_after_put - t_loop_start;
+        unsigned long long quiet_cycles = t_after_quiet - t_after_put;
+        unsigned long long loop_cycles = t_after_quiet - t_loop_start;
+
+        put_cycles_sum += put_cycles;
+        if (put_cycles > put_cycles_max) put_cycles_max = put_cycles;
+        quiet_cycles_sum += quiet_cycles;
+        if (quiet_cycles > quiet_cycles_max) quiet_cycles_max = quiet_cycles;
+        loop_cycles_sum += loop_cycles;
+        if (loop_cycles > loop_cycles_max) loop_cycles_max = loop_cycles;
     }
+
+    atomicAdd(&shmem_put_latency_put_cycles_sum, put_cycles_sum);
+    atomicMax(&shmem_put_latency_put_cycles_max, put_cycles_max);
+    atomicAdd(&shmem_put_latency_quiet_cycles_sum, quiet_cycles_sum);
+    atomicMax(&shmem_put_latency_quiet_cycles_max, quiet_cycles_max);
+    atomicAdd(&shmem_put_latency_loop_cycles_sum, loop_cycles_sum);
+    atomicMax(&shmem_put_latency_loop_cycles_max, loop_cycles_max);
+    atomicAdd(&shmem_put_latency_api_prof_count, (unsigned long long)iter);
 }
 
 #define LATENCY_THREADGROUP(group)                                                 \
@@ -213,6 +249,198 @@ static void print_table_cqe_to_thread(uint64_t *size, double *avg_ns, double *ma
     }
 }
 
+static void print_table_gpu_db_store(uint64_t *size, double *avg_ns, double *max_ns,
+                                     double *p50_ns, double *p95_ns, size_t *pair_count,
+                                     size_t *valid_count, size_t *negative_count,
+                                     int num_entries) {
+    bool machine_readable = false;
+    char *env_value = getenv("NVSHMEM_MACHINE_READABLE_OUTPUT");
+    if (env_value) machine_readable = atoi(env_value);
+
+    if (machine_readable) {
+        printf("%s\n", "shmem_put_latency_ibgda_gpu_db_store");
+        for (int i = 0; i < num_entries; ++i) {
+            if (size[i] == 0 || pair_count[i] == 0) continue;
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___avg %lf -ns\n",
+                   size[i], avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___max %lf -ns\n",
+                   size[i], max_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___p50 %lf -ns\n",
+                   size[i], p50_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___p95 %lf -ns\n",
+                   size[i], p95_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___pair_count %zu -count\n",
+                   size[i], pair_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___valid_count %zu -count\n",
+                   size[i], valid_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_gpu_db_store___Thread___size__%lu___negative_count %zu -count\n",
+                   size[i], negative_count[i]);
+        }
+        return;
+    }
+
+    printf("#%10s\n", "shmem_put_latency_ibgda_gpu_db_store");
+    printf("%-10s  %-8s  %-12s  %-12s  %-12s  %-12s  %-12s  %-12s  %-15s\n",
+           "size(B)", "scope", "avg(ns)", "max(ns)", "p50(ns)", "p95(ns)",
+           "pair_count", "valid_count", "negative_count");
+    for (int i = 0; i < num_entries; ++i) {
+        if (size[i] == 0 || pair_count[i] == 0) continue;
+        printf("%-10lu  %-8s  %-12.6lf  %-12.6lf  %-12.6lf  %-12.6lf  %-12zu  %-12zu  %-15zu\n",
+               size[i], "Thread", avg_ns[i], max_ns[i], p50_ns[i], p95_ns[i],
+               pair_count[i], valid_count[i], negative_count[i]);
+    }
+}
+
+static void print_table_db_to_cqe(uint64_t *size, double *avg_ns, double *max_ns,
+                                  double *p50_ns, double *p95_ns, size_t *db_pair_count,
+                                  size_t *cqe_pair_count, size_t *matched_count,
+                                  size_t *negative_count, size_t *over_cap_count,
+                                  size_t *unmatched_count, size_t *invalid_format_count,
+                                  int num_entries) {
+    bool machine_readable = false;
+    char *env_value = getenv("NVSHMEM_MACHINE_READABLE_OUTPUT");
+    if (env_value) machine_readable = atoi(env_value);
+
+    if (machine_readable) {
+        printf("%s\n", "shmem_put_latency_ibgda_db_to_cqe");
+        for (int i = 0; i < num_entries; ++i) {
+            if (size[i] == 0 || db_pair_count[i] == 0) continue;
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___avg %lf -ns\n",
+                   size[i], avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___max %lf -ns\n",
+                   size[i], max_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___p50 %lf -ns\n",
+                   size[i], p50_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___p95 %lf -ns\n",
+                   size[i], p95_ns[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___db_pair_count %zu -count\n",
+                   size[i], db_pair_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___cqe_pair_count %zu -count\n",
+                   size[i], cqe_pair_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___matched_count %zu -count\n",
+                   size[i], matched_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___negative_count %zu -count\n",
+                   size[i], negative_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___over_cap_count %zu -count\n",
+                   size[i], over_cap_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___unmatched_count %zu -count\n",
+                   size[i], unmatched_count[i]);
+            printf("&&&& PERF shmem_put_latency_ibgda_db_to_cqe___Thread___size__%lu___invalid_format_count %zu -count\n",
+                   size[i], invalid_format_count[i]);
+        }
+        return;
+    }
+
+    printf("#%10s\n", "shmem_put_latency_ibgda_db_to_cqe");
+    printf("%-10s  %-8s  %-12s  %-12s  %-12s  %-12s  %-14s  %-14s  %-14s  %-15s  %-14s  %-15s  %-20s\n",
+           "size(B)", "scope", "avg(ns)", "max(ns)", "p50(ns)", "p95(ns)",
+           "db_pair_count", "cqe_pair_count", "matched_count", "negative_count",
+           "over_cap_count", "unmatched_count", "invalid_format_count");
+    for (int i = 0; i < num_entries; ++i) {
+        if (size[i] == 0 || db_pair_count[i] == 0) continue;
+        printf("%-10lu  %-8s  %-12.6lf  %-12.6lf  %-12.6lf  %-12.6lf  %-14zu  %-14zu  %-14zu  %-15zu  %-14zu  %-15zu  %-20zu\n",
+               size[i], "Thread", avg_ns[i], max_ns[i], p50_ns[i], p95_ns[i],
+               db_pair_count[i], cqe_pair_count[i], matched_count[i], negative_count[i],
+               over_cap_count[i], unmatched_count[i], invalid_format_count[i]);
+    }
+}
+
+static void print_table_api_breakdown(uint64_t *size, double *put_avg_ns, double *put_max_ns,
+                                      double *quiet_avg_ns, double *quiet_max_ns,
+                                      double *loop_avg_ns, double *loop_max_ns,
+                                      size_t *sample_count, int num_entries) {
+    bool machine_readable = false;
+    char *env_value = getenv("NVSHMEM_MACHINE_READABLE_OUTPUT");
+    if (env_value) machine_readable = atoi(env_value);
+
+    if (machine_readable) {
+        printf("%s\n", "shmem_put_latency_api_breakdown");
+        for (int i = 0; i < num_entries; ++i) {
+            if (size[i] == 0 || sample_count[i] == 0) continue;
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___put_nbi_avg %lf -ns\n",
+                   size[i], put_avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___put_nbi_max %lf -ns\n",
+                   size[i], put_max_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___quiet_avg %lf -ns\n",
+                   size[i], quiet_avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___quiet_max %lf -ns\n",
+                   size[i], quiet_max_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___put_quiet_loop_avg %lf -ns\n",
+                   size[i], loop_avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___put_quiet_loop_max %lf -ns\n",
+                   size[i], loop_max_ns[i]);
+            printf("&&&& PERF shmem_put_latency_api_breakdown___Thread___size__%lu___sample_count %zu -count\n",
+                   size[i], sample_count[i]);
+        }
+        return;
+    }
+
+    printf("#%10s\n", "shmem_put_latency_api_breakdown");
+    printf("%-10s  %-8s  %-14s  %-14s  %-14s  %-14s  %-20s  %-20s  %-14s\n",
+           "size(B)", "scope", "put_avg(ns)", "put_max(ns)", "quiet_avg(ns)",
+           "quiet_max(ns)", "put_quiet_avg(ns)", "put_quiet_max(ns)", "sample_count");
+    for (int i = 0; i < num_entries; ++i) {
+        if (size[i] == 0 || sample_count[i] == 0) continue;
+        printf("%-10lu  %-8s  %-14.6lf  %-14.6lf  %-14.6lf  %-14.6lf  %-20.6lf  %-20.6lf  %-14zu\n",
+               size[i], "Thread", put_avg_ns[i], put_max_ns[i], quiet_avg_ns[i],
+               quiet_max_ns[i], loop_avg_ns[i], loop_max_ns[i], sample_count[i]);
+    }
+}
+
+static void print_table_accounting(uint64_t *size, double *lat_us, double *wqe_avg_ns,
+                                   double *db_avg_ns, double *db_to_cqe_avg_ns,
+                                   double *cqe2gpu_avg_ns, double *api_put_avg_ns,
+                                   double *api_quiet_avg_ns, double *api_loop_avg_ns,
+                                   int num_entries) {
+    bool machine_readable = false;
+    char *env_value = getenv("NVSHMEM_MACHINE_READABLE_OUTPUT");
+    if (env_value) machine_readable = atoi(env_value);
+
+    if (machine_readable) {
+        printf("%s\n", "shmem_put_latency_accounting");
+        for (int i = 0; i < num_entries; ++i) {
+            if (size[i] == 0) continue;
+            double event_ns = lat_us[i] * 1000.0;
+            double wqe_db_ns = wqe_avg_ns[i] + db_avg_ns[i];
+            double db_cqe_thread_ns = db_to_cqe_avg_ns[i] + cqe2gpu_avg_ns[i];
+            double core_path_ns = wqe_db_ns + db_cqe_thread_ns;
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___event_latency %lf -ns\n",
+                   size[i], event_ns);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___wqe_plus_doorbell %lf -ns\n",
+                   size[i], wqe_db_ns);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___db_to_cqe_plus_cqe_to_thread %lf -ns\n",
+                   size[i], db_cqe_thread_ns);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___put_nbi_plus_quiet %lf -ns\n",
+                   size[i], api_loop_avg_ns[i]);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___event_minus_core_path %lf -ns\n",
+                   size[i], event_ns - core_path_ns);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___api_loop_minus_core_path %lf -ns\n",
+                   size[i], api_loop_avg_ns[i] - core_path_ns);
+            printf("&&&& PERF shmem_put_latency_accounting___Thread___size__%lu___event_minus_api_loop %lf -ns\n",
+                   size[i], event_ns - api_loop_avg_ns[i]);
+        }
+        return;
+    }
+
+    printf("#%10s\n", "shmem_put_latency_accounting");
+    printf("%-10s  %-8s  %-14s  %-14s  %-24s  %-20s  %-20s  %-20s  %-20s  %-20s  %-20s\n",
+           "size(B)", "scope", "event(ns)", "wqe+db(ns)", "db_cqe+cqe_thr(ns)",
+           "put_avg(ns)", "quiet_avg(ns)", "put+quiet(ns)", "event-core(ns)",
+           "api-core(ns)", "event-api(ns)");
+    for (int i = 0; i < num_entries; ++i) {
+        if (size[i] == 0) continue;
+        double event_ns = lat_us[i] * 1000.0;
+        double wqe_db_ns = wqe_avg_ns[i] + db_avg_ns[i];
+        double db_cqe_thread_ns = db_to_cqe_avg_ns[i] + cqe2gpu_avg_ns[i];
+        double core_path_ns = wqe_db_ns + db_cqe_thread_ns;
+        printf("%-10lu  %-8s  %-14.6lf  %-14.6lf  %-24.6lf  %-20.6lf  %-20.6lf  %-20.6lf  %-20.6lf  %-20.6lf  %-20.6lf\n",
+               size[i], "Thread", event_ns, wqe_db_ns, db_cqe_thread_ns,
+               api_put_avg_ns[i], api_quiet_avg_ns[i], api_loop_avg_ns[i],
+               event_ns - core_path_ns, api_loop_avg_ns[i] - core_path_ns,
+               event_ns - api_loop_avg_ns[i]);
+    }
+}
+
 typedef struct gpu_nic_clock_calibration_s {
     unsigned long long gpu_ref;
     long double nic_ref_ns;
@@ -232,6 +460,16 @@ static inline int64_t map_gpu_globaltimer_to_nic_ns(
     long double gpu_delta = (long double)((long long)gpu_timestamp - (long long)calib->gpu_ref);
     long double mapped_ns = calib->nic_ref_ns + gpu_delta * calib->nic_per_gpu_tick_ns;
     return (int64_t)llroundl(mapped_ns);
+}
+
+/* The mlx5 FREE_RUNNING CQE timestamp and ibv raw_clock values are raw NIC
+ * clock units on this platform, not nanoseconds. The calibration slope is
+ * therefore raw_units_per_gpu_ns; divide raw-domain deltas by it before
+ * printing ns. For realtime timestamps the slope is ~1, so this is harmless. */
+static inline uint64_t calibrated_clock_delta_to_ns(
+    const gpu_nic_clock_calibration_t *calib, uint64_t delta_units) {
+    if (!calib || calib->nic_per_gpu_tick_ns <= 0.0L) return delta_units;
+    return (uint64_t)llroundl((long double)delta_units / calib->nic_per_gpu_tick_ns);
 }
 
 typedef int (*query_clock_ns_fn_t)(unsigned long long *out_ns);
@@ -463,6 +701,71 @@ static int select_gpu_nic_calibration(int before_status,
     return status;
 }
 
+typedef struct shmem_put_latency_api_profile_s {
+    unsigned long long put_cycles_sum;
+    unsigned long long put_cycles_max;
+    unsigned long long quiet_cycles_sum;
+    unsigned long long quiet_cycles_max;
+    unsigned long long loop_cycles_sum;
+    unsigned long long loop_cycles_max;
+    unsigned long long count;
+} shmem_put_latency_api_profile_t;
+
+static int shmem_put_latency_api_profile_reset(void) {
+    const unsigned long long zero = 0;
+    cudaError_t err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_put_cycles_sum, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_put_cycles_max, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_quiet_cycles_sum, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_quiet_cycles_max, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_loop_cycles_sum, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_loop_cycles_max, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyToSymbol(shmem_put_latency_api_prof_count, &zero, sizeof(zero), 0,
+                             cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return (int)err;
+    return 0;
+}
+
+static int shmem_put_latency_api_profile_get(shmem_put_latency_api_profile_t *out) {
+    if (!out) return (int)cudaErrorInvalidValue;
+    memset(out, 0, sizeof(*out));
+    cudaError_t err;
+    err = cudaMemcpyFromSymbol(&out->put_cycles_sum, shmem_put_latency_put_cycles_sum,
+                               sizeof(out->put_cycles_sum), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->put_cycles_max, shmem_put_latency_put_cycles_max,
+                               sizeof(out->put_cycles_max), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->quiet_cycles_sum, shmem_put_latency_quiet_cycles_sum,
+                               sizeof(out->quiet_cycles_sum), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->quiet_cycles_max, shmem_put_latency_quiet_cycles_max,
+                               sizeof(out->quiet_cycles_max), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->loop_cycles_sum, shmem_put_latency_loop_cycles_sum,
+                               sizeof(out->loop_cycles_sum), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->loop_cycles_max, shmem_put_latency_loop_cycles_max,
+                               sizeof(out->loop_cycles_max), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpyFromSymbol(&out->count, shmem_put_latency_api_prof_count,
+                               sizeof(out->count), 0, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return (int)err;
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     int mype, npes, size;
     int *data_d = NULL;
@@ -517,6 +820,34 @@ int main(int argc, char *argv[]) {
     size_t *h_cqe_invalid_format_count = NULL;
     nvshmemx_ibgda_cqe_ts_pair_t *h_cqe_ts_pairs = NULL;
     uint64_t *h_cqe_delta_ns = NULL;
+
+    double *h_api_put_avg_ns = NULL;
+    double *h_api_put_max_ns = NULL;
+    double *h_api_quiet_avg_ns = NULL;
+    double *h_api_quiet_max_ns = NULL;
+    double *h_api_loop_avg_ns = NULL;
+    double *h_api_loop_max_ns = NULL;
+    size_t *h_api_sample_count = NULL;
+
+    double *h_gpu_db_store_avg_ns = NULL;
+    double *h_gpu_db_store_max_ns = NULL;
+    double *h_gpu_db_store_p50_ns = NULL;
+    double *h_gpu_db_store_p95_ns = NULL;
+    size_t *h_db_pair_count = NULL;
+    size_t *h_db_store_valid_count = NULL;
+    size_t *h_db_store_negative_count = NULL;
+    double *h_db_to_cqe_avg_ns = NULL;
+    double *h_db_to_cqe_max_ns = NULL;
+    double *h_db_to_cqe_p50_ns = NULL;
+    double *h_db_to_cqe_p95_ns = NULL;
+    size_t *h_db_to_cqe_matched_count = NULL;
+    size_t *h_db_to_cqe_negative_count = NULL;
+    size_t *h_db_to_cqe_over_cap_count = NULL;
+    size_t *h_db_to_cqe_unmatched_count = NULL;
+    size_t *h_db_to_cqe_invalid_format_count = NULL;
+    nvshmemx_ibgda_db_ts_pair_t *h_db_ts_pairs = NULL;
+    uint64_t *h_db_store_delta_ns = NULL;
+    uint64_t *h_db_to_cqe_delta_ns = NULL;
 
     /* Declared (without initializers) above any `goto finalize` so C++'s
      * goto-crosses-initialized-declaration rule doesn't fire. Filled in
@@ -583,6 +914,35 @@ int main(int argc, char *argv[]) {
         (nvshmemx_ibgda_cqe_ts_pair_t *)calloc((size_t)iter, sizeof(*h_cqe_ts_pairs));
     h_cqe_delta_ns = (uint64_t *)calloc((size_t)iter, sizeof(*h_cqe_delta_ns));
 
+    h_api_put_avg_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_put_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_quiet_avg_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_quiet_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_loop_avg_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_loop_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_api_sample_count = (size_t *)calloc(array_size, sizeof(size_t));
+
+    h_gpu_db_store_avg_ns = (double *)calloc(array_size, sizeof(double));
+    h_gpu_db_store_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_gpu_db_store_p50_ns = (double *)calloc(array_size, sizeof(double));
+    h_gpu_db_store_p95_ns = (double *)calloc(array_size, sizeof(double));
+    h_db_pair_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_store_valid_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_store_negative_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_to_cqe_avg_ns = (double *)calloc(array_size, sizeof(double));
+    h_db_to_cqe_max_ns = (double *)calloc(array_size, sizeof(double));
+    h_db_to_cqe_p50_ns = (double *)calloc(array_size, sizeof(double));
+    h_db_to_cqe_p95_ns = (double *)calloc(array_size, sizeof(double));
+    h_db_to_cqe_matched_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_to_cqe_negative_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_to_cqe_over_cap_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_to_cqe_unmatched_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_to_cqe_invalid_format_count = (size_t *)calloc(array_size, sizeof(size_t));
+    h_db_ts_pairs =
+        (nvshmemx_ibgda_db_ts_pair_t *)calloc((size_t)iter, sizeof(*h_db_ts_pairs));
+    h_db_store_delta_ns = (uint64_t *)calloc((size_t)iter, sizeof(*h_db_store_delta_ns));
+    h_db_to_cqe_delta_ns = (uint64_t *)calloc((size_t)iter, sizeof(*h_db_to_cqe_delta_ns));
+
     nvshmem_barrier_all();
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -641,6 +1001,8 @@ int main(int argc, char *argv[]) {
             /* Reset the CQE-timestamp ring buffer counter as well so the
              * pairs we fetch after the run correspond exactly to this size. */
             nvshmemx_ibgda_lat_profile_cqe_ts_reset();
+            nvshmemx_ibgda_lat_profile_db_ts_reset();
+            shmem_put_latency_api_profile_reset();
 
             cudaEventRecord(start);
             test_latency(data_d, nelems, mype, iter, test_cubin, 1);
@@ -678,7 +1040,9 @@ int main(int argc, char *argv[]) {
                        (unsigned long long)gpu_realtime_calib.fit_error_ns);
             }
             if (calib_status == 0 && gpu_nic_calib.fit_error_ns != UINT64_MAX) {
-                h_nic_gpu_sync_precision_ns[i] = (double)gpu_nic_calib.fit_error_ns;
+                h_nic_gpu_sync_precision_ns[i] =
+                    (double)calibrated_clock_delta_to_ns(&gpu_nic_calib,
+                                                         gpu_nic_calib.fit_error_ns);
             }
 
             /* Snapshot the IBGDA WQE-prep / doorbell-submit cycle counters
@@ -694,6 +1058,75 @@ int main(int argc, char *argv[]) {
                 h_wqe_max_ns[i] = (double)prof.wqe_cycles_max * cycle_to_ns;
                 h_db_max_ns[i]  = (double)prof.db_cycles_max * cycle_to_ns;
             }
+            shmem_put_latency_api_profile_t api_prof;
+            int api_prof_status = shmem_put_latency_api_profile_get(&api_prof);
+            if (api_prof_status == 0 && api_prof.count > 0 && prof_status == 0 &&
+                prof.gpu_clock_hz > 0.0) {
+                double cycle_to_ns = 1.0e9 / prof.gpu_clock_hz;
+                h_api_put_avg_ns[i] =
+                    ((double)api_prof.put_cycles_sum / (double)api_prof.count) * cycle_to_ns;
+                h_api_put_max_ns[i] = (double)api_prof.put_cycles_max * cycle_to_ns;
+                h_api_quiet_avg_ns[i] =
+                    ((double)api_prof.quiet_cycles_sum / (double)api_prof.count) * cycle_to_ns;
+                h_api_quiet_max_ns[i] = (double)api_prof.quiet_cycles_max * cycle_to_ns;
+                h_api_loop_avg_ns[i] =
+                    ((double)api_prof.loop_cycles_sum / (double)api_prof.count) * cycle_to_ns;
+                h_api_loop_max_ns[i] = (double)api_prof.loop_cycles_max * cycle_to_ns;
+                h_api_sample_count[i] = (size_t)api_prof.count;
+            }
+            if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
+                printf("API_TS_DEBUG size=%d api_prof_status=%d api_count=%llu prof_status=%d gpu_clock_hz=%lf\n",
+                       size, api_prof_status, (unsigned long long)api_prof.count,
+                       prof_status, prof.gpu_clock_hz);
+            }
+
+            size_t db_pair_count = 0;
+            int db_ts_status = cudaErrorInvalidValue;
+            if (h_db_ts_pairs && iter > 0) {
+                db_ts_status = nvshmemx_ibgda_lat_profile_db_ts_get(
+                    h_db_ts_pairs, (size_t)iter, &db_pair_count);
+                if (db_ts_status == 0) h_db_pair_count[i] = db_pair_count;
+
+                if (db_ts_status == 0 && db_pair_count > 0) {
+                    long double db_store_sum_ns = 0.0L;
+                    uint64_t db_store_max_ns = 0;
+                    size_t db_store_valid_count = 0;
+                    size_t db_store_negative_count = 0;
+
+                    for (size_t k = 0; k < db_pair_count; ++k) {
+                        unsigned long long before = h_db_ts_pairs[k].db_before_gpu_ns;
+                        unsigned long long after = h_db_ts_pairs[k].db_after_gpu_ns;
+                        if (after < before) {
+                            db_store_negative_count++;
+                            continue;
+                        }
+
+                        uint64_t delta_ns = (uint64_t)(after - before);
+                        db_store_sum_ns += (long double)delta_ns;
+                        if (delta_ns > db_store_max_ns) db_store_max_ns = delta_ns;
+                        if (h_db_store_delta_ns) {
+                            h_db_store_delta_ns[db_store_valid_count] = delta_ns;
+                        }
+                        db_store_valid_count++;
+                    }
+
+                    h_db_store_valid_count[i] = db_store_valid_count;
+                    h_db_store_negative_count[i] = db_store_negative_count;
+                    if (db_store_valid_count > 0) {
+                        h_gpu_db_store_avg_ns[i] =
+                            (double)(db_store_sum_ns / (long double)db_store_valid_count);
+                        h_gpu_db_store_max_ns[i] = (double)db_store_max_ns;
+                        if (h_db_store_delta_ns) {
+                            qsort(h_db_store_delta_ns, db_store_valid_count,
+                                  sizeof(*h_db_store_delta_ns), compare_u64);
+                            h_gpu_db_store_p50_ns[i] = (double)percentile_nearest_rank_u64(
+                                h_db_store_delta_ns, db_store_valid_count, 50);
+                            h_gpu_db_store_p95_ns[i] = (double)percentile_nearest_rank_u64(
+                                h_db_store_delta_ns, db_store_valid_count, 95);
+                        }
+                    }
+                }
+            }
 
             /* Drain the CQE-timestamp pair buffer and convert each pair to a
              * NIC->GPU thread CQE-read ns delta in the NIC timestamp domain.
@@ -705,8 +1138,9 @@ int main(int argc, char *argv[]) {
                     h_cqe_ts_pairs, (size_t)iter, &pair_count);
                 if (ts_status == 0) h_cqe_pair_count[i] = pair_count;
                 if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
-                    printf("CQE_TS_DEBUG size=%d ts_status=%d pair_count=%zu ci.mask=%#lx\n",
-                           size, ts_status, pair_count, (unsigned long)ci.mask);
+                    printf("CQE_TS_DEBUG size=%d ts_status=%d pair_count=%zu db_ts_status=%d db_pair_count=%zu ci.mask=%#lx\n",
+                           size, ts_status, pair_count, db_ts_status, db_pair_count,
+                           (unsigned long)ci.mask);
                 }
                 if (ts_status == 0 && pair_count > 0) {
                     /* Refresh clock_info after the measured run for diagnostics. */
@@ -741,11 +1175,18 @@ int main(int argc, char *argv[]) {
                         size_t raw_clock_count = 0;
                         size_t invalid_format_count = 0;
                         uint64_t active_fit_error_ns =
-                            calib_status == 0 ? gpu_nic_calib.fit_error_ns : UINT64_MAX;
+                            calib_status == 0
+                                ? calibrated_clock_delta_to_ns(&gpu_nic_calib,
+                                                               gpu_nic_calib.fit_error_ns)
+                                : UINT64_MAX;
                         if (realtime_calib_status == 0 &&
                             (active_fit_error_ns == UINT64_MAX ||
-                             gpu_realtime_calib.fit_error_ns > active_fit_error_ns)) {
-                            active_fit_error_ns = gpu_realtime_calib.fit_error_ns;
+                             calibrated_clock_delta_to_ns(&gpu_realtime_calib,
+                                                          gpu_realtime_calib.fit_error_ns) >
+                                 active_fit_error_ns)) {
+                            active_fit_error_ns =
+                                calibrated_clock_delta_to_ns(&gpu_realtime_calib,
+                                                             gpu_realtime_calib.fit_error_ns);
                         }
                         uint64_t sanity_cap_ns =
                             (uint64_t)((h_lat[i] > 0.0 ? h_lat[i] * 1000.0 : 0.0) * 64.0);
@@ -786,20 +1227,22 @@ int main(int argc, char *argv[]) {
                             }
                             int64_t gpu_nic_ns = map_gpu_globaltimer_to_nic_ns(
                                 timestamp_calib, h_cqe_ts_pairs[k].gpu_now_ns);
-                            int64_t delta_ns = gpu_nic_ns - (int64_t)cqe_timestamp_ns;
+                            int64_t delta_units = gpu_nic_ns - (int64_t)cqe_timestamp_ns;
 
-                            if (delta_ns < 0) {
+                            if (delta_units < 0) {
                                 negative_count++;
                                 continue;
                             }
+                            uint64_t delta_ns = calibrated_clock_delta_to_ns(
+                                timestamp_calib, (uint64_t)delta_units);
                             if ((uint64_t)delta_ns > sanity_cap_ns) {
                                 over_cap_count++;
                                 continue;
                             }
 
                             sum_ns += (long double)delta_ns;
-                            if ((uint64_t)delta_ns > max_ns) max_ns = (uint64_t)delta_ns;
-                            if (h_cqe_delta_ns) h_cqe_delta_ns[valid_count] = (uint64_t)delta_ns;
+                            if (delta_ns > max_ns) max_ns = delta_ns;
+                            if (h_cqe_delta_ns) h_cqe_delta_ns[valid_count] = delta_ns;
                             valid_count++;
                         }
 
@@ -818,6 +1261,124 @@ int main(int argc, char *argv[]) {
                                     h_cqe_delta_ns, valid_count, 50);
                                 h_cqe2gpu_p95_ns[i] = (double)percentile_nearest_rank_u64(
                                     h_cqe_delta_ns, valid_count, 95);
+                            }
+                        }
+                        if (db_ts_status == 0 && db_pair_count > 0 && h_db_ts_pairs) {
+                            long double db_to_cqe_sum_ns = 0.0L;
+                            uint64_t db_to_cqe_max_ns = 0;
+                            size_t matched_count = 0;
+                            size_t db_to_cqe_negative_count = 0;
+                            size_t db_to_cqe_over_cap_count = 0;
+                            size_t db_to_cqe_unmatched_count = 0;
+                            size_t db_to_cqe_invalid_format_count = 0;
+
+                            for (size_t db_idx = 0; db_idx < db_pair_count; ++db_idx) {
+                                unsigned long long prod_idx = h_db_ts_pairs[db_idx].prod_idx;
+                                int64_t best_delta_ns = INT64_MAX;
+                                bool saw_candidate = false;
+                                bool saw_invalid_format = false;
+                                bool saw_negative = false;
+
+                                for (int exact_only = 1; exact_only >= 0; --exact_only) {
+                                    for (size_t cqe_idx = 0; cqe_idx < pair_count; ++cqe_idx) {
+                                        if (exact_only) {
+                                            if (h_cqe_ts_pairs[cqe_idx].completed_idx != prod_idx)
+                                                continue;
+                                        } else if (h_cqe_ts_pairs[cqe_idx].completed_idx <
+                                                   prod_idx) {
+                                            continue;
+                                        }
+
+                                        saw_candidate = true;
+                                        uint64_t cqe_realtime_ns = 0;
+                                        uint64_t cqe_timestamp_ns = 0;
+                                        uint32_t cqe_sec = 0;
+                                        const gpu_nic_clock_calibration_t *timestamp_calib = NULL;
+                                        bool cqe_is_realtime = cqe_timestamp_realtime_ns(
+                                            h_cqe_ts_pairs[cqe_idx].cqe_ts_cycles,
+                                            &cqe_realtime_ns, &cqe_sec, NULL) &&
+                                            cqe_realtime_sec_in_window((uint64_t)cqe_sec,
+                                                                       wall_ref_sec);
+                                        if (cqe_is_realtime && realtime_calib_status == 0) {
+                                            cqe_timestamp_ns = cqe_realtime_ns;
+                                            timestamp_calib = &gpu_realtime_calib;
+                                        } else if (!cqe_is_realtime && calib_status == 0) {
+                                            uint64_t raw_clock_ns =
+                                                h_cqe_ts_pairs[cqe_idx].cqe_ts_cycles;
+                                            if (cqe_realtime_sec_in_window(
+                                                    raw_clock_ns / NSEC_PER_SEC, raw_ref_sec)) {
+                                                cqe_timestamp_ns = raw_clock_ns;
+                                                timestamp_calib = &gpu_nic_calib;
+                                            } else {
+                                                saw_invalid_format = true;
+                                                continue;
+                                            }
+                                        } else {
+                                            saw_invalid_format = true;
+                                            continue;
+                                        }
+
+                                        int64_t db_after_ns = map_gpu_globaltimer_to_nic_ns(
+                                            timestamp_calib,
+                                            h_db_ts_pairs[db_idx].db_after_gpu_ns);
+                                        int64_t delta_units =
+                                            (int64_t)cqe_timestamp_ns - db_after_ns;
+                                        if (delta_units < 0) {
+                                            saw_negative = true;
+                                            continue;
+                                        }
+                                        int64_t delta_ns =
+                                            (int64_t)calibrated_clock_delta_to_ns(
+                                                timestamp_calib, (uint64_t)delta_units);
+                                        if (delta_ns < best_delta_ns) best_delta_ns = delta_ns;
+                                    }
+                                    if (best_delta_ns != INT64_MAX || saw_candidate) break;
+                                }
+
+                                if (best_delta_ns == INT64_MAX) {
+                                    if (saw_invalid_format) {
+                                        db_to_cqe_invalid_format_count++;
+                                    } else if (saw_candidate && saw_negative) {
+                                        db_to_cqe_negative_count++;
+                                    } else {
+                                        db_to_cqe_unmatched_count++;
+                                    }
+                                    continue;
+                                }
+                                if ((uint64_t)best_delta_ns > sanity_cap_ns) {
+                                    db_to_cqe_over_cap_count++;
+                                    continue;
+                                }
+
+                                db_to_cqe_sum_ns += (long double)best_delta_ns;
+                                if ((uint64_t)best_delta_ns > db_to_cqe_max_ns) {
+                                    db_to_cqe_max_ns = (uint64_t)best_delta_ns;
+                                }
+                                if (h_db_to_cqe_delta_ns) {
+                                    h_db_to_cqe_delta_ns[matched_count] =
+                                        (uint64_t)best_delta_ns;
+                                }
+                                matched_count++;
+                            }
+
+                            h_db_to_cqe_matched_count[i] = matched_count;
+                            h_db_to_cqe_negative_count[i] = db_to_cqe_negative_count;
+                            h_db_to_cqe_over_cap_count[i] = db_to_cqe_over_cap_count;
+                            h_db_to_cqe_unmatched_count[i] = db_to_cqe_unmatched_count;
+                            h_db_to_cqe_invalid_format_count[i] =
+                                db_to_cqe_invalid_format_count;
+                            if (matched_count > 0) {
+                                h_db_to_cqe_avg_ns[i] =
+                                    (double)(db_to_cqe_sum_ns / (long double)matched_count);
+                                h_db_to_cqe_max_ns[i] = (double)db_to_cqe_max_ns;
+                                if (h_db_to_cqe_delta_ns) {
+                                    qsort(h_db_to_cqe_delta_ns, matched_count,
+                                          sizeof(*h_db_to_cqe_delta_ns), compare_u64);
+                                    h_db_to_cqe_p50_ns[i] = (double)percentile_nearest_rank_u64(
+                                        h_db_to_cqe_delta_ns, matched_count, 50);
+                                    h_db_to_cqe_p95_ns[i] = (double)percentile_nearest_rank_u64(
+                                        h_db_to_cqe_delta_ns, matched_count, 95);
+                                }
                             }
                         }
                         if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
@@ -853,11 +1414,17 @@ int main(int argc, char *argv[]) {
                                         : 0;
                                 uint64_t chosen_cqe_ns =
                                     cqe_realtime_ok ? cqe_realtime_ns : cqe_raw_clock_ns;
-                                int64_t delta_ns = cqe_realtime_ok || cqe_raw_clock_ok
-                                                       ? gpu_nic_ns - (int64_t)chosen_cqe_ns
-                                                       : 0;
-                                printf("CQE_TS_DEBUG sample[%zu] cqe_ts_raw=%llu cqe_sec=%u cqe_nsec=%u cqe_decode_ok=%d cqe_sec_ok=%d cqe_realtime_ns=%llu cqe_raw_clock_ok=%d cqe_raw_clock_ns=%llu gpu_ns=%llu gpu_nic_ns=%lld delta_ns=%lld\n",
+                                int64_t delta_units = cqe_realtime_ok || cqe_raw_clock_ok
+                                                          ? gpu_nic_ns - (int64_t)chosen_cqe_ns
+                                                          : 0;
+                                int64_t delta_ns =
+                                    delta_units > 0
+                                        ? (int64_t)calibrated_clock_delta_to_ns(
+                                              timestamp_calib, (uint64_t)delta_units)
+                                        : delta_units;
+                                printf("CQE_TS_DEBUG sample[%zu] completed_idx=%llu cqe_ts_raw=%llu cqe_sec=%u cqe_nsec=%u cqe_decode_ok=%d cqe_sec_ok=%d cqe_realtime_ns=%llu cqe_raw_clock_ok=%d cqe_raw_clock_ns=%llu gpu_ns=%llu gpu_nic_raw=%lld delta_raw=%lld delta_ns=%lld\n",
                                        k,
+                                       (unsigned long long)h_cqe_ts_pairs[k].completed_idx,
                                        (unsigned long long)h_cqe_ts_pairs[k].cqe_ts_cycles,
                                        cqe_sec, cqe_nsec, cqe_ts_ok ? 1 : 0,
                                        cqe_sec_ok ? 1 : 0,
@@ -866,7 +1433,81 @@ int main(int argc, char *argv[]) {
                                        (unsigned long long)cqe_raw_clock_ns,
                                        (unsigned long long)h_cqe_ts_pairs[k].gpu_now_ns,
                                        (long long)gpu_nic_ns,
-                                       (long long)delta_ns);
+                                       (long long)delta_units, (long long)delta_ns);
+                            }
+                            for (size_t k = 0; k < db_pair_count && k < 4; ++k) {
+                                unsigned long long before = h_db_ts_pairs[k].db_before_gpu_ns;
+                                unsigned long long after = h_db_ts_pairs[k].db_after_gpu_ns;
+                                printf("DB_TS_DEBUG sample[%zu] prod_idx=%llu db_before_gpu_ns=%llu db_after_gpu_ns=%llu gpu_store_delta_ns=%lld\n",
+                                       k,
+                                       (unsigned long long)h_db_ts_pairs[k].prod_idx,
+                                       before, after, (long long)(after - before));
+                            }
+                            for (size_t db_idx = 0; db_idx < db_pair_count && db_idx < 4;
+                                 ++db_idx) {
+                                unsigned long long prod_idx = h_db_ts_pairs[db_idx].prod_idx;
+                                size_t best_cqe_idx = pair_count;
+                                uint64_t best_cqe_timestamp_ns = 0;
+                                int64_t best_db_after_ns = 0;
+                                int64_t best_delta_ns = INT64_MAX;
+                                for (int exact_only = 1; exact_only >= 0; --exact_only) {
+                                    for (size_t cqe_idx = 0; cqe_idx < pair_count; ++cqe_idx) {
+                                        if (exact_only) {
+                                            if (h_cqe_ts_pairs[cqe_idx].completed_idx != prod_idx)
+                                                continue;
+                                        } else if (h_cqe_ts_pairs[cqe_idx].completed_idx <
+                                                   prod_idx) {
+                                            continue;
+                                        }
+
+                                        uint64_t cqe_realtime_ns = 0;
+                                        uint64_t cqe_timestamp_ns = 0;
+                                        uint32_t cqe_sec = 0;
+                                        const gpu_nic_clock_calibration_t *timestamp_calib = NULL;
+                                        bool cqe_is_realtime = cqe_timestamp_realtime_ns(
+                                            h_cqe_ts_pairs[cqe_idx].cqe_ts_cycles,
+                                            &cqe_realtime_ns, &cqe_sec, NULL) &&
+                                            cqe_realtime_sec_in_window((uint64_t)cqe_sec,
+                                                                       wall_ref_sec);
+                                        if (cqe_is_realtime && realtime_calib_status == 0) {
+                                            cqe_timestamp_ns = cqe_realtime_ns;
+                                            timestamp_calib = &gpu_realtime_calib;
+                                        } else if (!cqe_is_realtime && calib_status == 0) {
+                                            cqe_timestamp_ns = h_cqe_ts_pairs[cqe_idx].cqe_ts_cycles;
+                                            timestamp_calib = &gpu_nic_calib;
+                                        } else {
+                                            continue;
+                                        }
+
+                                        int64_t db_after_ns = map_gpu_globaltimer_to_nic_ns(
+                                            timestamp_calib,
+                                            h_db_ts_pairs[db_idx].db_after_gpu_ns);
+                                        int64_t delta_units =
+                                            (int64_t)cqe_timestamp_ns - db_after_ns;
+                                        if (delta_units < 0) continue;
+                                        int64_t delta_ns =
+                                            (int64_t)calibrated_clock_delta_to_ns(
+                                                timestamp_calib, (uint64_t)delta_units);
+                                        if (delta_ns < best_delta_ns) {
+                                            best_cqe_idx = cqe_idx;
+                                            best_cqe_timestamp_ns = cqe_timestamp_ns;
+                                            best_db_after_ns = db_after_ns;
+                                            best_delta_ns = delta_ns;
+                                        }
+                                    }
+                                    if (best_cqe_idx != pair_count) break;
+                                }
+                                if (best_cqe_idx >= pair_count) {
+                                    printf("DB_TS_DEBUG match[%zu] prod_idx=%llu cqe_idx=none\n",
+                                           db_idx, prod_idx);
+                                    continue;
+                                }
+                                printf("DB_TS_DEBUG match[%zu] prod_idx=%llu cqe_idx=%zu completed_idx=%llu cqe_ts_ns=%llu db_after_mapped_ns=%lld db_to_cqe_ns=%lld\n",
+                                       db_idx, prod_idx, best_cqe_idx,
+                                       (unsigned long long)
+                                           h_cqe_ts_pairs[best_cqe_idx].completed_idx,
+                                       (unsigned long long)best_cqe_timestamp_ns,
+                                       (long long)best_db_after_ns, (long long)best_delta_ns);
                             }
                         }
                     } else if (debug_cqe_ts && atoi(debug_cqe_ts) != 0) {
@@ -911,6 +1552,24 @@ int main(int argc, char *argv[]) {
                                   h_cqe_pair_count, h_cqe_valid_count,
                                   h_cqe_negative_count, h_cqe_over_cap_count,
                                   h_cqe_raw_clock_count, h_cqe_invalid_format_count, i);
+        print_table_gpu_db_store(h_size_arr, h_gpu_db_store_avg_ns, h_gpu_db_store_max_ns,
+                                 h_gpu_db_store_p50_ns, h_gpu_db_store_p95_ns,
+                                 h_db_pair_count, h_db_store_valid_count,
+                                 h_db_store_negative_count, i);
+        print_table_db_to_cqe(h_size_arr, h_db_to_cqe_avg_ns, h_db_to_cqe_max_ns,
+                              h_db_to_cqe_p50_ns, h_db_to_cqe_p95_ns,
+                              h_db_pair_count, h_cqe_pair_count, h_db_to_cqe_matched_count,
+                              h_db_to_cqe_negative_count, h_db_to_cqe_over_cap_count,
+                              h_db_to_cqe_unmatched_count,
+                              h_db_to_cqe_invalid_format_count, i);
+        print_table_api_breakdown(h_size_arr, h_api_put_avg_ns, h_api_put_max_ns,
+                                  h_api_quiet_avg_ns, h_api_quiet_max_ns,
+                                  h_api_loop_avg_ns, h_api_loop_max_ns,
+                                  h_api_sample_count, i);
+        print_table_accounting(h_size_arr, h_lat, h_wqe_avg_ns, h_db_avg_ns,
+                               h_db_to_cqe_avg_ns, h_cqe2gpu_avg_ns,
+                               h_api_put_avg_ns, h_api_quiet_avg_ns,
+                               h_api_loop_avg_ns, i);
         print_table_basic("shmem_put_latency_nic_gpu_clock_sync", "precision",
                           "size (Bytes)", "nic_gpu_sync_precision", "ns", '-',
                           h_size_arr, h_nic_gpu_sync_precision_ns, i);
@@ -1005,6 +1664,34 @@ finalize:
     free(h_cqe_invalid_format_count);
     free(h_cqe_ts_pairs);
     free(h_cqe_delta_ns);
+
+    free(h_api_put_avg_ns);
+    free(h_api_put_max_ns);
+    free(h_api_quiet_avg_ns);
+    free(h_api_quiet_max_ns);
+    free(h_api_loop_avg_ns);
+    free(h_api_loop_max_ns);
+    free(h_api_sample_count);
+
+    free(h_gpu_db_store_avg_ns);
+    free(h_gpu_db_store_max_ns);
+    free(h_gpu_db_store_p50_ns);
+    free(h_gpu_db_store_p95_ns);
+    free(h_db_pair_count);
+    free(h_db_store_valid_count);
+    free(h_db_store_negative_count);
+    free(h_db_to_cqe_avg_ns);
+    free(h_db_to_cqe_max_ns);
+    free(h_db_to_cqe_p50_ns);
+    free(h_db_to_cqe_p95_ns);
+    free(h_db_to_cqe_matched_count);
+    free(h_db_to_cqe_negative_count);
+    free(h_db_to_cqe_over_cap_count);
+    free(h_db_to_cqe_unmatched_count);
+    free(h_db_to_cqe_invalid_format_count);
+    free(h_db_ts_pairs);
+    free(h_db_store_delta_ns);
+    free(h_db_to_cqe_delta_ns);
 
     finalize_wrapper();
 

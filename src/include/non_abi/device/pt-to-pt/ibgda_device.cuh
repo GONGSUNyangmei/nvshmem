@@ -233,13 +233,20 @@ extern __device__ unsigned long long nvshmemi_ibgda_lat_prof_count;
 /* Per-iter CQE-timestamp ring buffer. The arrays are allocated and the
    device pointers + cap are published by the host via
    nvshmemx_ibgda_lat_profile_cqe_ts_reset(). The recorder in ibgda_poll_cq
-   writes (cqe_ts_cycles, gpu_now_ns) pairs at slot = atomicAdd(&count, 1)
+   writes (completed_idx, cqe_ts_cycles, gpu_now_ns) tuples at slot = atomicAdd(&count, 1)
    while count < cap, then keeps incrementing count past cap so the host can
    detect overflow. */
+extern __device__ unsigned long long *nvshmemi_ibgda_cqe_completed_idx_buf;
 extern __device__ unsigned long long *nvshmemi_ibgda_cqe_ts_buf;
 extern __device__ unsigned long long *nvshmemi_ibgda_gpu_ns_buf;
 extern __device__ unsigned long long nvshmemi_ibgda_cqe_ts_cap;
 extern __device__ unsigned long long nvshmemi_ibgda_cqe_ts_count;
+
+extern __device__ unsigned long long *nvshmemi_ibgda_db_prod_idx_buf;
+extern __device__ unsigned long long *nvshmemi_ibgda_db_before_buf;
+extern __device__ unsigned long long *nvshmemi_ibgda_db_after_buf;
+extern __device__ unsigned long long nvshmemi_ibgda_db_ts_cap;
+extern __device__ unsigned long long nvshmemi_ibgda_db_ts_count;
 
 #ifdef NVSHMEM_IBGDA_LAT_PROFILE
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record(
@@ -253,19 +260,37 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_rec
     atomicAdd_system(&nvshmemi_ibgda_lat_prof_count, 1ull);
 }
 
-/* Append one (HCA cycles, GPU globaltimer ns) pair to the ring buffer if
-   the host has published a buffer and we're still under cap. Always
-   advances the device count so the host can see overflow via
+/* Append one (completed index, HCA cycles, GPU globaltimer ns) tuple to the
+   ring buffer if the host has published a buffer and we're still under cap.
+   Always advances the device count so the host can see overflow via
    count > cap. */
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record_cqe_ts(
-    unsigned long long cqe_ts_cycles, unsigned long long gpu_now_ns) {
+    unsigned long long completed_idx, unsigned long long cqe_ts_cycles,
+    unsigned long long gpu_now_ns) {
     unsigned long long cap = nvshmemi_ibgda_cqe_ts_cap;
     unsigned long long slot = atomicAdd_system(&nvshmemi_ibgda_cqe_ts_count, 1ULL);
-    if (cap == 0 || nvshmemi_ibgda_cqe_ts_buf == nullptr ||
+    if (cap == 0 || nvshmemi_ibgda_cqe_completed_idx_buf == nullptr ||
+        nvshmemi_ibgda_cqe_ts_buf == nullptr ||
         nvshmemi_ibgda_gpu_ns_buf == nullptr) return;
     if (slot < cap) {
+        nvshmemi_ibgda_cqe_completed_idx_buf[slot] = completed_idx;
         nvshmemi_ibgda_cqe_ts_buf[slot] = cqe_ts_cycles;
         nvshmemi_ibgda_gpu_ns_buf[slot] = gpu_now_ns;
+    }
+}
+
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record_db_ts(
+    unsigned long long prod_idx, unsigned long long db_before_gpu_ns,
+    unsigned long long db_after_gpu_ns) {
+    unsigned long long cap = nvshmemi_ibgda_db_ts_cap;
+    unsigned long long slot = atomicAdd_system(&nvshmemi_ibgda_db_ts_count, 1ULL);
+    if (cap == 0 || nvshmemi_ibgda_db_prod_idx_buf == nullptr ||
+        nvshmemi_ibgda_db_before_buf == nullptr ||
+        nvshmemi_ibgda_db_after_buf == nullptr) return;
+    if (slot < cap) {
+        nvshmemi_ibgda_db_prod_idx_buf[slot] = prod_idx;
+        nvshmemi_ibgda_db_before_buf[slot] = db_before_gpu_ns;
+        nvshmemi_ibgda_db_after_buf[slot] = db_after_gpu_ns;
     }
 }
 #endif
@@ -664,7 +689,8 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE int ibgda_poll_cq(
         cons_idx = ibgda_atomic_read(cq->cons_idx);
 #ifdef NVSHMEM_IBGDA_LAT_PROFILE
         if (record_this_cqe) {
-            ibgda_lat_prof_record_cqe_ts((unsigned long long)prof_cqe_ts,
+            ibgda_lat_prof_record_cqe_ts((unsigned long long)completed_idx,
+                                         (unsigned long long)prof_cqe_ts,
                                          (unsigned long long)prof_now_ns);
         }
 #endif
@@ -1728,7 +1754,20 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_post_send(
         IBGDA_MEMBAR();
         ibgda_update_dbr(qp, new_prod_idx);
         IBGDA_MEMBAR();
+
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+        unsigned long long db_before_gpu_ns = 0;
+        unsigned long long db_after_gpu_ns = 0;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(db_before_gpu_ns)::"memory");
+#endif
+
         ibgda_ring_db(qp, new_prod_idx);
+
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(db_after_gpu_ns)::"memory");
+        ibgda_lat_prof_record_db_ts((unsigned long long)new_prod_idx, db_before_gpu_ns,
+                                    db_after_gpu_ns);
+#endif
     }
 
     ibgda_lock_release<NVSHMEMI_THREADGROUP_THREAD>(&mvars->post_send_lock);
