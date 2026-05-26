@@ -35,6 +35,12 @@
 #define NSEC_PER_SEC 1000000000ULL
 #define CQE_REALTIME_SEC_WINDOW 3600ULL
 
+typedef enum shmem_put_latency_ibgda_write_mode_e {
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL = 0,
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE = 1,
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP = 2,
+} shmem_put_latency_ibgda_write_mode_t;
+
 __device__ __attribute__((used)) unsigned long long shmem_put_latency_put_cycles_sum = 0;
 __device__ __attribute__((used)) unsigned long long shmem_put_latency_put_cycles_max = 0;
 __device__ __attribute__((used)) unsigned long long shmem_put_latency_quiet_cycles_sum = 0;
@@ -47,7 +53,7 @@ __device__ __attribute__((used)) unsigned long long shmem_put_latency_api_prof_c
 extern "C" {
 #endif
 
-__global__ void latency_kern(int *data_d, int len, int pe, int iter) {
+__global__ void latency_kern(int *data_d, int len, int pe, int iter, int write_mode) {
     int i, peer;
     unsigned long long put_cycles_sum = 0;
     unsigned long long put_cycles_max = 0;
@@ -60,7 +66,12 @@ __global__ void latency_kern(int *data_d, int len, int pe, int iter) {
 
     for (i = 0; i < iter; i++) {
         unsigned long long t_loop_start = (unsigned long long)clock64();
-        nvshmem_int_put_nbi(data_d, data_d, len, peer);
+        if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE) {
+            if (len != 1) return;
+            nvshmem_int_p(data_d, *data_d, peer);
+        } else {
+            nvshmem_int_put_nbi(data_d, data_d, len, peer);
+        }
         unsigned long long t_after_put = (unsigned long long)clock64();
         nvshmem_quiet();
         unsigned long long t_after_quiet = (unsigned long long)clock64();
@@ -109,7 +120,18 @@ LATENCY_THREADGROUP(block)
 }
 #endif
 
-#define DEFINE_TEST_LATENCY(TG)                                                               \
+void test_latency(int *data_d, int len, int pe, int iter, CUfunction kernel, int threads,
+                  int write_mode) {
+    if (use_cubin) {
+        void *arglist[] = {(void *)&data_d, (void *)&len, (void *)&pe, (void *)&iter,
+                           (void *)&write_mode};
+        CU_CHECK(cuLaunchKernel(kernel, 1, 1, 1, threads, 1, 1, 0, NULL, arglist, NULL));
+    } else {
+        latency_kern<<<1, threads>>>(data_d, len, pe, iter, write_mode);
+    }
+}
+
+#define DEFINE_TEST_LATENCY_GROUP(TG)                                                         \
                                                                                               \
     void test_latency##TG(int *data_d, int len, int pe, int iter, CUfunction kernel,          \
                           int threads) {                                                      \
@@ -121,9 +143,8 @@ LATENCY_THREADGROUP(block)
         }                                                                                     \
     }
 
-DEFINE_TEST_LATENCY()
-DEFINE_TEST_LATENCY(_warp)
-DEFINE_TEST_LATENCY(_block)
+DEFINE_TEST_LATENCY_GROUP(_warp)
+DEFINE_TEST_LATENCY_GROUP(_block)
 
 struct gpu_calib_signal_t {
     volatile unsigned int request;
@@ -766,18 +787,157 @@ static int shmem_put_latency_api_profile_get(shmem_put_latency_api_profile_t *ou
     return 0;
 }
 
+static const char *shmem_put_latency_ibgda_write_mode_name(int write_mode) {
+    switch (write_mode) {
+        case SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL:
+            return "normal";
+        case SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE:
+            return "inline";
+        case SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP:
+            return "nop";
+        default:
+            return "unknown";
+    }
+}
+
+static int shmem_put_latency_parse_ibgda_write_mode_value(
+    const char *value, shmem_put_latency_ibgda_write_mode_t *write_mode) {
+    if (!value || !write_mode) return -1;
+
+    if (strcmp(value, "normal") == 0) {
+        *write_mode = SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL;
+        return 0;
+    }
+    if (strcmp(value, "inline") == 0) {
+        *write_mode = SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE;
+        return 0;
+    }
+    if (strcmp(value, "nop") == 0) {
+        *write_mode = SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int shmem_put_latency_parse_ibgda_write_mode_args(
+    int argc, char **argv, int *filtered_argc, char ***filtered_argv,
+    shmem_put_latency_ibgda_write_mode_t *write_mode) {
+    const char opt_name[] = "--ibgda-write-mode";
+    const char opt_name_eq[] = "--ibgda-write-mode=";
+    char **out_argv = NULL;
+    int out_argc = 0;
+    const char *env_mode = NULL;
+
+    if (!argv || !filtered_argc || !filtered_argv || !write_mode) return -1;
+
+    *write_mode = SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL;
+    env_mode = getenv("NVSHMEM_PERFTEST_IBGDA_WRITE_MODE");
+    if (env_mode && env_mode[0] != '\0' &&
+        shmem_put_latency_parse_ibgda_write_mode_value(env_mode, write_mode) != 0) {
+        fprintf(stderr,
+                "Unknown NVSHMEM_PERFTEST_IBGDA_WRITE_MODE '%s' "
+                "(expected normal, inline, or nop)\n",
+                env_mode);
+        return -1;
+    }
+
+    out_argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+    if (!out_argv) return -1;
+
+    out_argv[out_argc++] = argv[0];
+    for (int argi = 1; argi < argc; ++argi) {
+        if (strncmp(argv[argi], opt_name_eq, sizeof(opt_name_eq) - 1) == 0) {
+            const char *value = argv[argi] + sizeof(opt_name_eq) - 1;
+            if (shmem_put_latency_parse_ibgda_write_mode_value(value, write_mode) != 0) {
+                fprintf(stderr, "Unknown %s value '%s' (expected normal, inline, or nop)\n",
+                        opt_name, value);
+                free(out_argv);
+                return -1;
+            }
+            continue;
+        }
+
+        if (strcmp(argv[argi], opt_name) == 0) {
+            const char *value = NULL;
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "%s requires a value: normal, inline, or nop\n", opt_name);
+                free(out_argv);
+                return -1;
+            }
+            value = argv[++argi];
+            if (shmem_put_latency_parse_ibgda_write_mode_value(value, write_mode) != 0) {
+                fprintf(stderr, "Unknown %s value '%s' (expected normal, inline, or nop)\n",
+                        opt_name, value);
+                free(out_argv);
+                return -1;
+            }
+            continue;
+        }
+
+        out_argv[out_argc++] = argv[argi];
+    }
+
+    out_argv[out_argc] = NULL;
+    *filtered_argc = out_argc;
+    *filtered_argv = out_argv;
+    return 0;
+}
+
+static void print_ibgda_write_mode(int write_mode) {
+    const char *mode_name = shmem_put_latency_ibgda_write_mode_name(write_mode);
+    bool machine_readable = false;
+    char *env_value = getenv("NVSHMEM_MACHINE_READABLE_OUTPUT");
+    if (env_value) machine_readable = atoi(env_value);
+
+    if (machine_readable) {
+        printf("&&&& PERF shmem_put_latency_ibgda_write_mode___mode__%s 1 -count\n",
+               mode_name);
+    } else {
+        printf("ibgda_write_mode: %s\n", mode_name);
+    }
+}
+
 int main(int argc, char *argv[]) {
     int mype, npes, size;
     int *data_d = NULL;
 
-    read_args(argc, argv);
+    shmem_put_latency_ibgda_write_mode_t write_mode =
+        SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL;
+    int filtered_argc = argc;
+    char **filtered_argv = NULL;
+    if (shmem_put_latency_parse_ibgda_write_mode_args(argc, argv, &filtered_argc,
+                                                      &filtered_argv, &write_mode) != 0) {
+        return EXIT_FAILURE;
+    }
+
+    read_args(filtered_argc, filtered_argv);
+    argc = filtered_argc;
+    argv = filtered_argv;
+
+    if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP) {
+        fprintf(stderr,
+                "ibgda write mode 'nop' is reserved for the next phase and is not "
+                "implemented yet\n");
+        free(filtered_argv);
+        return EXIT_FAILURE;
+    }
+    if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE &&
+        (min_size != sizeof(int) || max_size != sizeof(int))) {
+        fprintf(stderr,
+                "ibgda write mode 'inline' currently supports exactly one 4-byte scalar WQE; "
+                "rerun with --min_size 4 --max_size 4\n");
+        free(filtered_argv);
+        return EXIT_FAILURE;
+    }
+
     int iter = iters;
     int skip = warmup_iters;
 
-    int array_size, i;
-    void **h_tables;
-    uint64_t *h_size_arr;
-    double *h_lat;
+    int array_size = 0, i = 0;
+    void **h_tables = NULL;
+    uint64_t *h_size_arr = NULL;
+    double *h_lat = NULL;
 
     float milliseconds;
     cudaEvent_t start, stop;
@@ -954,7 +1114,7 @@ int main(int argc, char *argv[]) {
             h_size_arr[i] = size;
             nelems = size / sizeof(int);
 
-            test_latency(data_d, nelems, mype, skip, test_cubin, 1);
+            test_latency(data_d, nelems, mype, skip, test_cubin, 1, (int)write_mode);
 
             /* The IBGDA CQ (and therefore the cached mlx5dv_clock_info) can be
              * created lazily by the first put/quiet. Fetch it after warmup,
@@ -1005,7 +1165,7 @@ int main(int argc, char *argv[]) {
             shmem_put_latency_api_profile_reset();
 
             cudaEventRecord(start);
-            test_latency(data_d, nelems, mype, iter, test_cubin, 1);
+            test_latency(data_d, nelems, mype, iter, test_cubin, 1, (int)write_mode);
             cudaEventRecord(stop);
 
             CUDA_CHECK(cudaGetLastError());
@@ -1523,6 +1683,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (mype == 0) {
+        print_ibgda_write_mode((int)write_mode);
         print_table_basic("shmem_put_latency", "Thread", "size (Bytes)", "latency", "us", '-',
                           h_size_arr, h_lat, i);
 
@@ -1575,62 +1736,68 @@ int main(int argc, char *argv[]) {
                           h_size_arr, h_nic_gpu_sync_precision_ns, i);
     }
 
-    i = 0;
-    for (size = min_size; size <= max_size; size *= step_factor) {
-        if (!mype) {
-            int nelems;
-            h_size_arr[i] = size;
-            nelems = size / sizeof(int);
+    if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL) {
+        i = 0;
+        for (size = min_size; size <= max_size; size *= step_factor) {
+            if (!mype) {
+                int nelems;
+                h_size_arr[i] = size;
+                nelems = size / sizeof(int);
 
-            test_latency_warp(data_d, nelems, mype, skip, test_cubin_warp, THREADS_PER_WARP);
-            cudaEventRecord(start);
-            test_latency_warp(data_d, nelems, mype, iter, test_cubin_warp, THREADS_PER_WARP);
-            cudaEventRecord(stop);
+                test_latency_warp(data_d, nelems, mype, skip, test_cubin_warp,
+                                  THREADS_PER_WARP);
+                cudaEventRecord(start);
+                test_latency_warp(data_d, nelems, mype, iter, test_cubin_warp,
+                                  THREADS_PER_WARP);
+                cudaEventRecord(stop);
 
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaEventSynchronize(stop));
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaEventSynchronize(stop));
 
-            /* give latency in us */
-            cudaEventElapsedTime(&milliseconds, start, stop);
-            h_lat[i] = (milliseconds * 1000) / iter;
-            i++;
+                /* give latency in us */
+                cudaEventElapsedTime(&milliseconds, start, stop);
+                h_lat[i] = (milliseconds * 1000) / iter;
+                i++;
+            }
+
+            nvshmem_barrier_all();
         }
 
-        nvshmem_barrier_all();
-    }
-
-    if (mype == 0) {
-        print_table_basic("shmem_put_latency", "Warp", "size (Bytes)", "latency", "us", '-',
-                          h_size_arr, h_lat, i);
-    }
-
-    i = 0;
-    for (size = min_size; size <= max_size; size *= step_factor) {
-        if (!mype) {
-            int nelems;
-            h_size_arr[i] = size;
-            nelems = size / sizeof(int);
-
-            test_latency_block(data_d, nelems, mype, skip, test_cubin_block, threads_per_block);
-            cudaEventRecord(start);
-            test_latency_block(data_d, nelems, mype, iter, test_cubin_block, threads_per_block);
-            cudaEventRecord(stop);
-
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaEventSynchronize(stop));
-
-            /* give latency in us */
-            cudaEventElapsedTime(&milliseconds, start, stop);
-            h_lat[i] = (milliseconds * 1000) / iter;
-            i++;
+        if (mype == 0) {
+            print_table_basic("shmem_put_latency", "Warp", "size (Bytes)", "latency", "us", '-',
+                              h_size_arr, h_lat, i);
         }
 
-        nvshmem_barrier_all();
-    }
+        i = 0;
+        for (size = min_size; size <= max_size; size *= step_factor) {
+            if (!mype) {
+                int nelems;
+                h_size_arr[i] = size;
+                nelems = size / sizeof(int);
 
-    if (mype == 0) {
-        print_table_basic("shmem_put_latency", "Block", "size (Bytes)", "latency", "us", '-',
-                          h_size_arr, h_lat, i);
+                test_latency_block(data_d, nelems, mype, skip, test_cubin_block,
+                                   threads_per_block);
+                cudaEventRecord(start);
+                test_latency_block(data_d, nelems, mype, iter, test_cubin_block,
+                                   threads_per_block);
+                cudaEventRecord(stop);
+
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaEventSynchronize(stop));
+
+                /* give latency in us */
+                cudaEventElapsedTime(&milliseconds, start, stop);
+                h_lat[i] = (milliseconds * 1000) / iter;
+                i++;
+            }
+
+            nvshmem_barrier_all();
+        }
+
+        if (mype == 0) {
+            print_table_basic("shmem_put_latency", "Block", "size (Bytes)", "latency", "us",
+                              '-', h_size_arr, h_lat, i);
+        }
     }
 
 finalize:
@@ -1644,7 +1811,7 @@ finalize:
             nvshmem_free(data_d);
         }
     }
-    free_tables(h_tables, 2);
+    if (h_tables) free_tables(h_tables, 2);
 
     free(h_wqe_avg_ns);
     free(h_wqe_max_ns);
@@ -1694,6 +1861,7 @@ finalize:
     free(h_db_to_cqe_delta_ns);
 
     finalize_wrapper();
+    free(filtered_argv);
 
     return 0;
 }

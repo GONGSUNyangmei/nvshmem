@@ -44,212 +44,19 @@ doorbell_submit:
 
 nic_cqe_to_gpu:
   CQE timestamp -> GPU thread observes the CQE in ibgda_poll_cq()
+
+gpu_db_store:
+  immediately before ibgda_ring_db() -> immediately after ibgda_ring_db()
+
+db_to_cqe:
+  GPU doorbell-store boundary -> requester CQE generation, matched by
+  prod_idx/completed_idx
 ```
 
-These are useful, but `doorbell_submit` is still a GPU-side submit-path time. It
-includes GPU fences, `ready_head` CAS/spin, DBR write, and the BlueFlame MMIO
-store. It is not the NIC firmware doorbell-processing time.
-
-The missing timestamp is the one immediately around the actual doorbell store in
-`ibgda_post_send()`.
-
-## Add Doorbell Timestamp Records
-
-Add a second device-side ring buffer for doorbell timestamps.
-
-Record one entry per real post-send:
-
-```c
-typedef struct nvshmemx_ibgda_db_ts_pair_s {
-    unsigned long long prod_idx;
-    unsigned long long db_before_gpu_ns;
-    unsigned long long db_after_gpu_ns;
-} nvshmemx_ibgda_db_ts_pair_t;
-```
-
-`prod_idx` must be the full `new_prod_idx`, not only the low 16-bit value passed
-to `ibgda_ring_db()`. It is needed to match the doorbell with the CQE's completed
-WQE index.
-
-### 1. Header API
-
-Edit `src/include/host/nvshmemx_ibgda_lat_profile.h`.
-
-Add:
-
-```c
-typedef struct nvshmemx_ibgda_db_ts_pair_s {
-    unsigned long long prod_idx;
-    unsigned long long db_before_gpu_ns;
-    unsigned long long db_after_gpu_ns;
-} nvshmemx_ibgda_db_ts_pair_t;
-
-int nvshmemx_ibgda_lat_profile_db_ts_reset(void);
-int nvshmemx_ibgda_lat_profile_db_ts_get(nvshmemx_ibgda_db_ts_pair_t *out,
-                                         size_t max_pairs, size_t *out_count);
-```
-
-Also extend the existing CQE pair with a completed WQE index:
-
-```c
-typedef struct nvshmemx_ibgda_cqe_ts_pair_s {
-    unsigned long long completed_idx;
-    unsigned long long cqe_ts_cycles;
-    unsigned long long gpu_now_ns;
-} nvshmemx_ibgda_cqe_ts_pair_t;
-```
-
-If ABI stability matters, create a new `nvshmemx_ibgda_cqe_ts_pair_v2_t` instead
-of changing the existing struct.
-
-### 2. Device Symbols and Host Accessors
-
-Edit `src/device/init/init_device.cu`.
-
-Add device symbols next to the existing CQE timestamp symbols:
-
-```c
-__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_prod_idx_buf = nullptr;
-__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_before_buf   = nullptr;
-__device__ __attribute__((used)) unsigned long long *nvshmemi_ibgda_db_after_buf    = nullptr;
-__device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_db_ts_cap       = 0;
-__device__ __attribute__((used)) unsigned long long  nvshmemi_ibgda_db_ts_count     = 0;
-```
-
-Implement `nvshmemx_ibgda_lat_profile_db_ts_reset()` and
-`nvshmemx_ibgda_lat_profile_db_ts_get()` by copying the pattern already used by:
-
-```c
-nvshmemx_ibgda_lat_profile_cqe_ts_reset()
-nvshmemx_ibgda_lat_profile_cqe_ts_get()
-```
-
-Use a separate env cap:
-
-```text
-NVSHMEM_IBGDA_DB_TS_BUF_CAP
-```
-
-Default can be `65536`, same as the CQE buffer.
-
-Also update the no-IBGDA stubs in the `#else /* !NVSHMEM_IBGDA_SUPPORT */`
-section.
-
-If symbol exports are required by this build, add the new APIs to
-`nvshmem_host.sym`.
-
-### 3. Device Recorder
-
-Edit `src/include/non_abi/device/pt-to-pt/ibgda_device.cuh`.
-
-Add extern declarations next to the CQE timestamp externs:
-
-```c
-extern __device__ unsigned long long *nvshmemi_ibgda_db_prod_idx_buf;
-extern __device__ unsigned long long *nvshmemi_ibgda_db_before_buf;
-extern __device__ unsigned long long *nvshmemi_ibgda_db_after_buf;
-extern __device__ unsigned long long  nvshmemi_ibgda_db_ts_cap;
-extern __device__ unsigned long long  nvshmemi_ibgda_db_ts_count;
-```
-
-Add a device helper under `#ifdef NVSHMEM_IBGDA_LAT_PROFILE`:
-
-```c
-__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_lat_prof_record_db_ts(
-    unsigned long long prod_idx,
-    unsigned long long db_before_gpu_ns,
-    unsigned long long db_after_gpu_ns) {
-    unsigned long long cap = nvshmemi_ibgda_db_ts_cap;
-    unsigned long long slot = atomicAdd_system(&nvshmemi_ibgda_db_ts_count, 1ULL);
-    if (cap == 0 || nvshmemi_ibgda_db_prod_idx_buf == nullptr ||
-        nvshmemi_ibgda_db_before_buf == nullptr ||
-        nvshmemi_ibgda_db_after_buf == nullptr) return;
-
-    if (slot < cap) {
-        nvshmemi_ibgda_db_prod_idx_buf[slot] = prod_idx;
-        nvshmemi_ibgda_db_before_buf[slot] = db_before_gpu_ns;
-        nvshmemi_ibgda_db_after_buf[slot] = db_after_gpu_ns;
-    }
-}
-```
-
-### 4. Timestamp the Real Doorbell Store
-
-Edit `ibgda_post_send()` in
-`src/include/non_abi/device/pt-to-pt/ibgda_device.cuh`.
-
-Current code:
-
-```c
-if (likely(new_prod_idx > old_prod_idx)) {
-    IBGDA_MEMBAR();
-    ibgda_update_dbr(qp, new_prod_idx);
-    IBGDA_MEMBAR();
-    ibgda_ring_db(qp, new_prod_idx);
-}
-```
-
-Change to:
-
-```c
-if (likely(new_prod_idx > old_prod_idx)) {
-    IBGDA_MEMBAR();
-    ibgda_update_dbr(qp, new_prod_idx);
-    IBGDA_MEMBAR();
-
-#ifdef NVSHMEM_IBGDA_LAT_PROFILE
-    unsigned long long db_before_gpu_ns = 0;
-    unsigned long long db_after_gpu_ns = 0;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(db_before_gpu_ns)::"memory");
-#endif
-
-    ibgda_ring_db(qp, new_prod_idx);
-
-#ifdef NVSHMEM_IBGDA_LAT_PROFILE
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(db_after_gpu_ns)::"memory");
-    ibgda_lat_prof_record_db_ts((unsigned long long)new_prod_idx,
-                                db_before_gpu_ns,
-                                db_after_gpu_ns);
-#endif
-}
-```
-
-`db_after_gpu_ns` is the best available "GPU has completed the doorbell store"
-boundary. After calibrating GPU `%globaltimer` to the mlx5 raw clock domain, use
-this as the left edge of `doorbell -> CQE`.
-
-### 5. Record CQE completed_idx
-
-In `ibgda_poll_cq()` the code already computes:
-
-```c
-completed_idx = ...
-record_target_cqe = (completed_idx >= idx);
-```
-
-Extend `ibgda_lat_prof_record_cqe_ts()` to store `completed_idx` as well:
-
-```c
-ibgda_lat_prof_record_cqe_ts((unsigned long long)completed_idx,
-                             (unsigned long long)prof_cqe_ts,
-                             (unsigned long long)prof_now_ns);
-```
-
-This allows matching:
-
-```text
-db record prod_idx == cqe record completed_idx
-```
-
-or, for coalesced CQEs:
-
-```text
-db record prod_idx <= cqe record completed_idx
-and the CQE is the first later CQE covering that prod_idx
-```
-
-For the cleanest per-iteration experiment, force one outstanding request and one
-CQE per iteration.
+`doorbell_submit` is still a GPU-side submit-path time. It includes GPU fences,
+`ready_head` CAS/spin, DBR write, and the BlueFlame MMIO store. It is not the
+NIC firmware doorbell-processing time. Use `gpu_db_store` and `db_to_cqe` for
+the finer split around the real doorbell boundary.
 
 ## Print New Metrics in shmem_put_latency.cu
 
@@ -392,26 +199,116 @@ nvshmem_int_p(data_d + j, *(data_d + j), peer);
 
 and the IBGDA scalar `p` path uses inline RDMA write WQEs for small values.
 
-For a clean apples-to-apples comparison inside `shmem_put_latency.cu`, add a
-new mode:
+### Implementation Decision
+
+Use one enhanced `shmem_put_latency.cu` binary with selectable modes. Do not
+create two new peer files such as `shmem_put_latency_inline.cu` and
+`shmem_put_latency_blueflame.cu`.
+
+Reason:
+
+```text
+normal / inline / nop / BlueFlame variants must share:
+  - the same warmup and measured iteration loop
+  - the same GPU->NIC clock calibration
+  - the same DB timestamp collection
+  - the same CQE timestamp collection
+  - the same prod_idx -> completed_idx matching logic
+  - the same output and accounting tables
+```
+
+Forking the test into separate files would almost certainly make the results
+drift because the calibration, reset, matching, and print paths would need to be
+kept in sync in multiple places.
+
+Recommended interface:
+
+```text
+./shmem_put_latency ... --ibgda-write-mode normal|inline|nop
+```
+
+Also keep an environment-variable fallback for scripts and old perftest harnesses:
 
 ```text
 NVSHMEM_PERFTEST_IBGDA_WRITE_MODE=normal|inline|nop
 ```
 
-Then route:
+If adding a new common perftest command-line option is too invasive, implement
+the environment variable first. It still gives the important property: one
+binary, one code path, one measurement pipeline.
+
+### Phase 1: Normal vs Inline in shmem_put_latency.cu
+
+Add a local enum:
+
+```c
+typedef enum shmem_put_latency_ibgda_write_mode_e {
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_NORMAL = 0,
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE = 1,
+    SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP    = 2,
+} shmem_put_latency_ibgda_write_mode_t;
+```
+
+Parse it on the host before the measurement loop:
+
+```text
+1. default: normal
+2. if --ibgda-write-mode is present, use it
+3. else if NVSHMEM_PERFTEST_IBGDA_WRITE_MODE is present, use it
+4. reject unknown strings with a clear error
+```
+
+Pass the mode into the single-thread kernel and cubin launch:
+
+```c
+__global__ void latency_kern(int *data_d, int len, int pe, int iter, int write_mode)
+```
+
+Update `test_latency()` and the `cuLaunchKernel()` arg list to include
+`write_mode`. Keep the current warp/block kernels normal-only at first. The
+`db_to_cqe` experiment needs one clean requester stream; warp/block modes add
+coalescing and extra WQEs that make the differential harder to interpret.
+
+Route the single-thread measured operation as:
 
 ```text
 normal:
-  current nvshmem_int_put_nbi + quiet
+  current path:
+    nvshmem_int_put_nbi(data_d, data_d, len, peer)
+    nvshmem_quiet()
 
 inline:
-  for 4B/8B only, call nvshmem_int_p / nvshmem_long_p in the kernel
-  or add a controlled IBGDA-only inline write path for bytes <= 12
+  first implementation: 4B only
+    require len == 1
+    nvshmem_int_p(data_d, *data_d, peer)
+    nvshmem_quiet()
+
+  optional extension: 8B only
+    use a correctly typed 8B symmetric buffer and nvshmem_long_p /
+    nvshmem_longlong_p, depending on the NVSHMEM API type available in this tree
+
+  do not loop over many ints in one iteration for the primary comparison,
+  because that changes the unit from "one WQE" to "many scalar WQEs plus one
+  quiet".
 
 nop:
-  enqueue a signaled NOP WQE with CQ update, then quiet/poll it
+  phase 2 helper, described below
 ```
+
+For inline mode, enforce:
+
+```text
+min_size == max_size == 4   for the first patch
+threads_per_block does not matter because only latency_kern is used
+no warp/block mode output, or print those tables only for normal mode
+```
+
+`perftest/device/pt-to-pt/shmem_p_latency.cu` is useful as a sanity check that
+the scalar `p` path reaches inline WQE helpers, but it should not be the primary
+measurement file because it does not share the new DB/CQE timestamp, calibration,
+and accounting code.
+
+### Phase 2: Add NOP Baseline
 
 The `nop` mode is valuable because it estimates the minimum:
 
@@ -420,6 +317,66 @@ doorbell + NIC WQE fetch/decode + CQE generation
 ```
 
 without local payload DMA read and without remote memory write.
+
+Implement it after normal/inline is working:
+
+```text
+1. Add an NVSHMEM_IBGDA_LAT_PROFILE-only device helper that reserves one WQE.
+2. Write a signaled NOP WQE with MLX5_WQE_CTRL_CQ_UPDATE.
+3. Submit it through the same ibgda_submit_requests() / ibgda_post_send() path.
+4. Wait with the same quiet/poll path so CQE timestamp matching still works.
+5. Keep it private to the profiling build; do not expose it as a public NVSHMEM API.
+```
+
+Relevant existing helper:
+
+```c
+ibgda_write_nop_wqe()
+```
+
+Expected measurements:
+
+```text
+T_normal(4B) - T_inline(4B)
+  -> gpu_payload_dma_extra_vs_inline_4B
+
+T_inline(4B) - T_nop
+  -> inline payload / remote write / ACK extra over minimal signaled WQE
+
+T_normal(4B) - T_nop
+  -> normal RDMA_WRITE data-segment path extra over minimal signaled WQE
+```
+
+### Output Plan
+
+Run one mode per process invocation and print the selected mode once before the
+tables:
+
+```text
+ibgda_write_mode: normal
+```
+
+For machine-readable output, include the mode in the metric name or as an extra
+field:
+
+```text
+shmem_put_latency_ibgda_db_to_cqe___mode__normal___size__4___avg
+shmem_put_latency_ibgda_db_to_cqe___mode__inline___size__4___avg
+shmem_put_latency_ibgda_db_to_cqe___mode__nop___size__4___avg
+```
+
+Do the subtraction in a small post-processing script or spreadsheet first. Do
+not make one run execute all modes back-to-back until the one-mode path is
+stable; separate invocations make it easier to spot calibration and warmup
+issues.
+
+Example run shape:
+
+```text
+NVSHMEM_PERFTEST_IBGDA_WRITE_MODE=normal ./shmem_put_latency ...
+NVSHMEM_PERFTEST_IBGDA_WRITE_MODE=inline ./shmem_put_latency ...
+NVSHMEM_PERFTEST_IBGDA_WRITE_MODE=nop    ./shmem_put_latency ...
+```
 
 ## BlueFlame On/Off Caveat
 
@@ -470,6 +427,125 @@ Then:
 WQE fetch extra ~= T_doorbell_only_nop - T_full_bf_nop
 ```
 
+### NOP and BlueFlame A/B
+
+Yes: the NOP operation should be run with the BlueFlame/db-mode switch. NOP is
+the cleanest operation for this A/B because it removes the local payload DMA read
+and the remote memory write payload from the normal put path.
+
+The useful comparison is:
+
+```text
+T_nop_sq_fetch:
+  doorbell/control + NIC DMA fetch of one NOP WQE from SQ memory +
+  WQE decode + requester CQE generation
+
+T_nop_full_bf:
+  BlueFlame push of the NOP WQE/control bytes +
+  WQE decode + requester CQE generation
+```
+
+Then:
+
+```text
+T_nop_sq_fetch - T_nop_full_bf
+  ~= one WQE fetch DMA cost - extra full-BF push/MMIO cost
+```
+
+So the difference is the best available estimate of one WQE fetch DMA extra, but
+do not call it an exact hardware counter. It is a differential estimate and still
+contains the cost difference between the two doorbell delivery mechanisms.
+
+This interpretation only holds if `full_bf_wqe` really pushes enough WQE bytes
+through BlueFlame that the NIC does not fetch the same WQE body from SQ memory.
+The current `ibgda_ring_db()` path writes only a 64-bit doorbell/control value to
+`qp->tx_wq.bf`; comparing that path against a proxy/non-BF control path measures
+doorbell/control-path differences, not one WQE DMA fetch time.
+
+### BlueFlame Implementation Plan
+
+Treat BlueFlame as a second axis, not as a second test file. The matrix should
+eventually be:
+
+```text
+write_mode: normal | inline | nop
+db_mode:    current_bf_control | non_bf_control_or_proxy | full_bf_wqe
+```
+
+Do not start by implementing all combinations. Use this order:
+
+```text
+1. normal + current_bf_control
+2. inline + current_bf_control
+3. nop + current_bf_control
+4. nop + an alternate doorbell path
+5. nop + full_bf_wqe, only if the HCA/UAR mode supports pushing the WQE body
+```
+
+Important naming:
+
+```text
+current_bf_control:
+  the current 64-bit store to qp->tx_wq.bf in ibgda_ring_db().
+  This is a BlueFlame/UAR doorbell store, not proof that the full WQE body was
+  delivered through BlueFlame.
+
+non_bf_control_or_proxy:
+  an alternate control path that avoids the same GPU UAR MMIO store. If it uses
+  the existing proxy mechanism, label it as proxy/control-path comparison, not
+  as pure BlueFlame-off latency.
+
+full_bf_wqe:
+  a mode that pushes enough WQE bytes through the BF/MMIO region that the NIC
+  does not need to fetch the same WQE body from SQ memory. Only call a result
+  "WQE fetch extra" after this is verified.
+```
+
+The BlueFlame control may need to be an NVSHMEM/IBGDA environment variable
+rather than a per-kernel argument because QP doorbell pointers are populated
+during transport initialization:
+
+```text
+NVSHMEM_PERFTEST_IBGDA_WRITE_MODE=nop
+NVSHMEM_IBGDA_LAT_PROFILE_DB_MODE=current_bf_control|proxy_control|full_bf_wqe
+```
+
+Implementation steps for `current_bf_control` are already mostly done by the DB
+timestamp work:
+
+```text
+1. timestamp immediately before ibgda_ring_db()
+2. execute the 64-bit store to qp->tx_wq.bf
+3. timestamp immediately after ibgda_ring_db()
+4. match the DB record to the CQE by prod_idx/completed_idx
+```
+
+Implementation steps for a safe alternate doorbell experiment:
+
+```text
+1. Add an IBGDA profiling-only db_mode parsed during transport init.
+2. Keep the WQE body construction identical.
+3. Change only the post-send doorbell/control mechanism.
+4. Reject unsupported combinations at startup instead of silently falling back.
+5. Print db_mode next to write_mode in every table.
+```
+
+Implementation steps for `full_bf_wqe`, if supported:
+
+```text
+1. Start with nop, not normal put, so the WQE is small and deterministic.
+2. Add ibgda_ring_db_full_bf(qp, prod_idx, wqe_ptr, wqe_bytes).
+3. Copy the required WQEBB bytes to the BF/UAR region with the ordering required
+   by mlx5 for this UAR mode.
+4. Keep the existing SQ-memory WQE valid until verification proves the NIC did
+   not fetch it.
+5. Compare nop/current_bf_control against nop/full_bf_wqe.
+```
+
+Only after `nop/full_bf_wqe` is verified should normal and inline be run with
+that DB mode. Otherwise the result mixes too many effects: WQE construction,
+payload DMA, remote write, ACK, CQE generation, and doorbell delivery.
+
 If full BF is not implemented, use `T_nop` only as a lower-bound baseline for
 doorbell/FW/WQE-decode/CQE generation.
 
@@ -501,19 +577,24 @@ export NVSHMEM_PERFTEST_CQE_TS_DEBUG=1
 Run these modes:
 
 ```text
-1. nop, 4B-equivalent signaled:
-   estimates minimal doorbell/FW/WQE/CQE baseline.
+1. nop + current_bf_control:
+   estimates minimal doorbell/FW/WQE/CQE baseline for the current 64-bit BF
+   control-doorbell path.
 
-2. inline scalar 4B and 8B:
+2. nop + full_bf_wqe, if supported:
+   compare against nop/current_bf_control or nop/sq_fetch to estimate one WQE
+   fetch-DMA extra. This is the cleanest BlueFlame A/B.
+
+3. inline scalar 4B and 8B:
    use shmem_p_latency or the new inline mode.
 
-3. normal put 4B, 8B, 16B, 32B, 64B, ..., max_size:
+4. normal put 4B, 8B, 16B, 32B, 64B, ..., max_size:
    current shmem_put_latency normal mode.
 
-4. loopback / same-host back-to-back:
+5. loopback / same-host back-to-back:
    estimates local path without full fabric distance.
 
-5. two-host path:
+6. two-host path:
    normal experiment across the target fabric.
 ```
 
@@ -523,9 +604,14 @@ Compute:
 T_db_to_cqe_normal(size)
 T_db_to_cqe_inline(size)
 T_db_to_cqe_nop
+T_db_to_cqe_nop_sq_fetch
+T_db_to_cqe_nop_full_bf
 
 payload_dma_extra_vs_inline(size)
   = T_db_to_cqe_normal(size) - T_db_to_cqe_inline(size)
+
+wqe_fetch_dma_extra_estimate
+  ~= T_db_to_cqe_nop_sq_fetch - T_db_to_cqe_nop_full_bf
 
 non_payload_base(size)
   ~= T_db_to_cqe_inline(size)
