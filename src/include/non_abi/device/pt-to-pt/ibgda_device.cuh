@@ -192,6 +192,12 @@ static_assert(sizeof(ibgda_atomic_64_masked_cs_seg_t) == 16,
               "sizeof(ibgda_atomic_64_masked_cs_seg_t) == 16 failed.");
 #endif
 
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void
+nvshmemx_ibgda_lat_profile_nop_nbi(int dst_pe,
+                                   nvshmemx_qp_handle_t qp_index = NVSHMEMX_QP_DEFAULT);
+#endif
+
 #ifdef __CUDA_ARCH__
 
 #ifdef NVSHMEM_TIMEOUT_DEVICE_POLLING
@@ -2160,6 +2166,31 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE bool ibgda_can_coalesce
     __match_all_sync(amask, pe, &pred_same_pe);
     return pred_same_pe;
 }
+
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void
+nvshmemx_ibgda_lat_profile_nop_nbi(int dst_pe, nvshmemx_qp_handle_t qp_index) {
+    int proxy_pe = ibgda_get_proxy_pe(dst_pe);
+    bool is_qp_shared_among_ctas = false;
+    nvshmemi_ibgda_device_qp_t *qp =
+        ibgda_get_qp(proxy_pe, &is_qp_shared_among_ctas, qp_index);
+    const uint16_t num_wqes = 1;
+
+    unsigned long long t_prof_entry = (unsigned long long)clock64();
+    uint64_t base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes, is_qp_shared_among_ctas);
+    void *wqe_ptrs[1];
+    wqe_ptrs[0] = ibgda_get_wqe_ptr(qp, (uint16_t)base_wqe_idx);
+    ibgda_write_nop_wqe(qp, (uint16_t)base_wqe_idx, wqe_ptrs);
+
+    unsigned long long t_prof_pre_db = (unsigned long long)clock64();
+    if (is_qp_shared_among_ctas)
+        ibgda_submit_requests<true>(qp, base_wqe_idx, num_wqes);
+    else
+        ibgda_submit_requests<false>(qp, base_wqe_idx, num_wqes);
+    unsigned long long t_prof_post_db = (unsigned long long)clock64();
+    ibgda_lat_prof_record(t_prof_pre_db - t_prof_entry, t_prof_post_db - t_prof_pre_db);
+}
+#endif
 
 __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE uint64_t
 ibgda_cst(nvshmemi_ibgda_device_qp_t *dci, bool is_dci_shared_among_ctas) {

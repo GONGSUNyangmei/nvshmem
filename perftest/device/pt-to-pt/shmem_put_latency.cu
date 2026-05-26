@@ -23,6 +23,7 @@
 #include <time.h>
 #include "utils.h"
 #include "host/nvshmemx_ibgda_lat_profile.h"
+#include "non_abi/device/pt-to-pt/ibgda_device.cuh"
 
 /* mlx5dv.h declares struct mlx5dv_clock_info used by the optional host-side
  * transport diagnostics in main(). The bitcode/cubin device-only pass
@@ -69,6 +70,13 @@ __global__ void latency_kern(int *data_d, int len, int pe, int iter, int write_m
         if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE) {
             if (len != 1) return;
             nvshmem_int_p(data_d, *data_d, peer);
+        } else if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP) {
+            if (len != 1) return;
+#ifdef NVSHMEM_IBGDA_LAT_PROFILE
+            nvshmemx_ibgda_lat_profile_nop_nbi(peer);
+#else
+            return;
+#endif
         } else {
             nvshmem_int_put_nbi(data_d, data_d, len, peer);
         }
@@ -915,18 +923,21 @@ int main(int argc, char *argv[]) {
     argc = filtered_argc;
     argv = filtered_argv;
 
+#ifndef NVSHMEM_IBGDA_LAT_PROFILE
     if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP) {
         fprintf(stderr,
-                "ibgda write mode 'nop' is reserved for the next phase and is not "
-                "implemented yet\n");
+                "ibgda write mode 'nop' requires NVSHMEM_IBGDA_LAT_PROFILE support\n");
         free(filtered_argv);
         return EXIT_FAILURE;
     }
-    if (write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE &&
+#endif
+    if ((write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_INLINE ||
+         write_mode == SHMEM_PUT_LATENCY_IBGDA_WRITE_NOP) &&
         (min_size != sizeof(int) || max_size != sizeof(int))) {
         fprintf(stderr,
-                "ibgda write mode 'inline' currently supports exactly one 4-byte scalar WQE; "
-                "rerun with --min_size 4 --max_size 4\n");
+                "ibgda write mode '%s' currently reports one 4-byte-equivalent WQE; "
+                "rerun with --min_size 4 --max_size 4\n",
+                shmem_put_latency_ibgda_write_mode_name((int)write_mode));
         free(filtered_argv);
         return EXIT_FAILURE;
     }
